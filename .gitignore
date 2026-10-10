@@ -1,0 +1,13 @@
+node_modules
+.next
+.env*.local
+next-env.d.ts
+*.tsbuildinfo
+
+# 公開版（AIなし）の書き出し
+/out
+/.next-static
+
+# 個人の設定・Macのファイル
+.claude/
+.DS_Store

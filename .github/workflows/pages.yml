@@ -1,0 +1,47 @@
+# 公開版（AIなし）を GitHub Pages に公開する。
+# main ブランチに push すると、自動で書き出して公開される。
+# サーバーもAPIキーも使わない（名簿・答案・採点結果は各先生の端末のブラウザ内だけに保存される）。
+name: 公開版をGitHub Pagesに公開
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: 公開版を書き出す
+        run: npm run build:static
+        env:
+          # https://<ユーザー名>.github.io/<リポジトリ名>/ に置くため
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .next-static
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
