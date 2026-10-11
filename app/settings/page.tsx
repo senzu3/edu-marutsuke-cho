@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { MODELS, db, deleteAll, exportAll, getSetting, importAll, setSetting } from "@/lib/db";
+import { OwnApiKey } from "@/components/OwnApiKey";
 import { STATIC_EDITION } from "@/lib/edition";
 import { useAbc, useGradingMode } from "@/lib/settings-hooks";
 
@@ -81,9 +82,14 @@ const Settings = () => {
         <ul className="list-disc space-y-1 pl-5 text-sm leading-relaxed">
           <li>名簿・採点結果・分析はすべて<b>この端末のブラウザ内</b>に保存されます。サーバーには保存しません。</li>
           {STATIC_EDITION ? (
-            <li>
-              この公開版は<b>AIを使いません</b>。答案の写真・切り出し画像・名簿を含め、<b>どこにも送信しません</b>（画面の部品を読み込むだけで、データを受け取るサーバーはありません）。
-            </li>
+            <>
+              <li>
+                この公開版は、ふだんは<b>AIを使いません</b>。答案の写真・切り出し画像・名簿を含め、<b>どこにも送信しません</b>（画面の部品を読み込むだけで、データを受け取るサーバーはありません）。
+              </li>
+              <li>
+                下の「自分のAPIキーでAIを使う」でキーを登録したときだけ、名前欄を塗りつぶした画像・切り出した解答欄を、この端末から<b>直接</b> Anthropic社のAIに送ります。氏名・出席番号・正答は送りません。
+              </li>
+            </>
           ) : (
             <>
           <li>
@@ -151,9 +157,10 @@ const Settings = () => {
 
       <section className="card space-y-4">
         <h2 className="text-lg font-bold">採点の設定</h2>
-        {STATIC_EDITION ? (
+        {STATIC_EDITION && <OwnApiKey />}
+        {STATIC_EDITION && aiAvailable === false ? (
           <p className="rounded-lg bg-accent/5 p-3 text-sm">
-            公開版は<b>AIなし（先生が○✕）</b>で動きます。解答欄を切り出して並べるので、見ながらタップで○✕をつけてください。画像はどこにも送らず、費用もかかりません。
+            いまは<b>AIなし（先生が○✕）</b>で動いています。解答欄を切り出して並べるので、見ながらタップで○✕をつけてください。画像はどこにも送らず、費用もかかりません。
           </p>
         ) : (
           <>
@@ -181,7 +188,7 @@ const Settings = () => {
               </span>
             </label>
           ))}
-          {aiAvailable === false && (
+          {aiAvailable === false && !STATIC_EDITION && (
             <p className="text-xs text-review">APIキーが設定されていないため、AIなしで動いています。キーの設定方法は README.md の「セットアップ」を見てください。</p>
           )}
         </fieldset>

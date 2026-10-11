@@ -42,7 +42,7 @@ const RootLayout = ({ children }: { children: React.ReactNode }) => (
       <main className="mx-auto max-w-6xl px-4 py-6">{children}</main>
       <footer className="mx-auto max-w-6xl px-4 pb-8 text-xs text-muted">
         {STATIC_EDITION
-          ? "🔒 公開版（AIなし）：名簿・答案の画像・採点結果は、この端末のブラウザ内だけに保存されます。どこにも送信しません。"
+          ? "🔒 公開版：名簿・答案の画像・採点結果は、この端末のブラウザ内だけに保存されます。どこにも送信しません（自分のAPIキーでAIを使う設定にしたときだけ、名前欄を塗りつぶした解答欄の画像をAIに送ります）。"
           : "🔒 名簿・採点結果はこの端末のブラウザ内だけに保存されます。AIには、名前欄を塗りつぶしたうえで切り出した「解答欄の画像」だけを送ります（名前・正答は送りません）。"}
       </footer>
     </body>

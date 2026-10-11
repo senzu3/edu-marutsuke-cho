@@ -1,4 +1,5 @@
-import type { Kanten, ModelId, Rect } from "./db";
+import { type Kanten, type ModelId, type Rect, getSetting } from "./db";
+import { STATIC_EDITION } from "./edition";
 import type { Transcription } from "./judge";
 import type { Subject } from "./subjects";
 
@@ -22,10 +23,23 @@ const post = async <T>(path: string, body: unknown): Promise<T> => {
   return json as T;
 };
 
+/** 公開版：先生が自分で入れたAPIキー（この端末にだけ保存）。なければAIは使えない */
+const ownKey = async () => {
+  const key = await getSetting("apiKey", "");
+  if (!key) throw new Error("APIキーが登録されていません。「名簿・設定」で登録してください。");
+  return key;
+};
+
 /** 模範解答（名前欄は黒塗り済み）から問題・正答・解答欄の位置を読み取る */
-export const requestExtractKey = (image: string, model: ModelId, subject: Subject) =>
-  post<ExtractedKey>("/api/extract-key", { image, model, subject });
+export const requestExtractKey = async (image: string, model: ModelId, subject: Subject): Promise<ExtractedKey> => {
+  if (!STATIC_EDITION) return post<ExtractedKey>("/api/extract-key", { image, model, subject });
+  const { extractKeyDirect } = await import("./ai-browser");
+  return extractKeyDirect(await ownKey(), image, model, subject);
+};
 
 /** 送るのは「解答欄の切り出し画像」と「答えの形のヒント」だけ。氏名・出席番号・答案全体・正答は送らない */
-export const requestGrade = (items: GradeRequestItem[], model: ModelId, subject: Subject) =>
-  post<GradeResponse>("/api/grade", { items, model, subject });
+export const requestGrade = async (items: GradeRequestItem[], model: ModelId, subject: Subject): Promise<GradeResponse> => {
+  if (!STATIC_EDITION) return post<GradeResponse>("/api/grade", { items, model, subject });
+  const { transcribeDirect } = await import("./ai-browser");
+  return transcribeDirect(await ownKey(), items, model, subject);
+};

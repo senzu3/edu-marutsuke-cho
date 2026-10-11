@@ -13,10 +13,13 @@ export const useModel = (): ModelId => {
 
 export const useKeepImages = () => useLiveQuery(() => db.settings.get("keepImages"))?.value === "true";
 
-/** サーバーでAIが使えるか（APIキーが設定されているか）。確認中は null */
+/** 公開版で先生が登録したAPIキーがあるか。確認中は undefined */
+export const useOwnKeySet = () => useLiveQuery(async () => !!(await db.settings.get("apiKey"))?.value, []);
+
+/** AIが使えるか（サーバー版：サーバーにAPIキーがあるか／公開版：先生が自分のキーを登録したか）。確認中は null */
 export const useAiAvailable = () => {
-  // 公開版（AIなし）はサーバーがないので、問い合わせずに「AIなし」
-  const [available, setAvailable] = useState<boolean | null>(STATIC_EDITION ? false : null);
+  const ownKeySet = useOwnKeySet();
+  const [available, setAvailable] = useState<boolean | null>(null);
   useEffect(() => {
     if (STATIC_EDITION) return;
     fetch("/api/status")
@@ -24,6 +27,7 @@ export const useAiAvailable = () => {
       .then((j) => setAvailable(!!j.aiAvailable))
       .catch(() => setAvailable(false));
   }, []);
+  if (STATIC_EDITION) return ownKeySet ?? null;
   return available;
 };
 
