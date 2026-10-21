@@ -12,14 +12,26 @@ import { PhotoInput } from "@/components/PhotoInput";
 import { useAnswerKey } from "@/lib/answer-key";
 import { allowsPartial, needsImage } from "@/lib/judge";
 import { subjectOf } from "@/lib/subjects";
+import { gradeDraftKey, clearDraft, loadDraft, useAutoSaveDraft } from "@/lib/drafts";
 import { type ResultItem, SIDE_LABEL, type Side, type Test, calcScore, db, getSetting, gradedSides, setSetting, sheetOf, sidesOf } from "@/lib/db";
 import { type PreparedSheet, type Verdict, applyVerdict, gradeSheet, isUnjudged, manualItems, prepareSheet, questionsOn, saveResult } from "@/lib/grading";
 import { useGradingMode, useKeepImages, useModel } from "@/lib/settings-hooks";
-import { QUALITY_MESSAGES, type Quad, type SourceImage, defaultQuad, detectQuad, loadSource } from "@/lib/warp";
+import { QUALITY_MESSAGES, type Quad, type SourceImage, defaultQuad, detectQuad, encodeJpeg, loadSource } from "@/lib/warp";
 
 type Stage = "photo" | "corners" | "quality" | "grading" | "review";
 /** 裏面があるテストの採点の順番：1人ずつ表→裏 / 全員の表を先に */
 type SideOrder = "student" | "side";
+
+/** 採点の途中の状態（アプリを閉じても、この児童・この面の続きから再開する） */
+type GradeDraft = {
+  studentNo: number;
+  side: Side;
+  stage: "corners" | "review";
+  source: Blob; // 撮った写真（端末内のみ。確定・やり直しで消す）
+  quad: Quad;
+  autoCorners: boolean;
+  items: ResultItem[];
+};
 
 const Grade = () => {
   const testId = Number(useSearchParams().get("id"));
@@ -38,6 +50,7 @@ const Grade = () => {
   }, []);
   const [stage, setStage] = useState<Stage>("photo");
   const [source, setSource] = useState<SourceImage | null>(null);
+  const [sourceBlob, setSourceBlob] = useState<Blob | null>(null);
   const [quad, setQuad] = useState<Quad>(defaultQuad());
   const [sheet, setSheet] = useState<PreparedSheet | null>(null);
   const [items, setItems] = useState<ResultItem[]>([]);
@@ -46,6 +59,53 @@ const Grade = () => {
   // 教員用の解答用紙と並べて見比べるか
   const [compare, setCompare] = useState(true);
   const answerKey = useAnswerKey(test);
+  // 前回の途中から再開したか（復元が終わるまでは、最初の児童を自動で選ばない）
+  const [restoring, setRestoring] = useState(true);
+  const [resumed, setResumed] = useState(false);
+  const draftKey = gradeDraftKey(testId);
+
+  // 前回の途中の状態を復元する
+  useEffect(() => {
+    if (!test || !students) return;
+    let cancelled = false;
+    (async () => {
+      const draft = await loadDraft<GradeDraft>(draftKey);
+      if (draft && students.some((s) => s.no === draft.studentNo) && sheetOf(test, draft.side)) {
+        const loaded = await loadSource(draft.source);
+        if (cancelled) return;
+        setStudentNo(draft.studentNo);
+        setSide(draft.side);
+        setSource(loaded);
+        setSourceBlob(draft.source);
+        setQuad(draft.quad);
+        setAutoCorners(draft.autoCorners);
+        if (draft.stage === "review") {
+          setSheet(await prepareSheet(loaded, draft.quad, test, draft.side));
+          setItems(draft.items);
+        }
+        setStage(draft.stage);
+        setResumed(true);
+      }
+      if (!cancelled) setRestoring(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!!test, !!students, draftKey]);
+
+  // 写真を撮ったあと〜確定までの状態を、自動で端末内に保存する
+  const draftValue = useMemo<GradeDraft | null>(
+    () =>
+      sourceBlob && studentNo !== null && stage !== "photo"
+        ? { studentNo, side, stage: stage === "review" ? "review" : "corners", source: sourceBlob, quad, autoCorners, items: stage === "review" ? items : [] }
+        : null,
+    [sourceBlob, studentNo, side, stage, quad, autoCorners, items],
+  );
+  const draftMeta = test && studentNo !== null
+    ? { label: `${test.title}の採点（${studentNo}番${test.back ? `・${SIDE_LABEL[side]}面` : ""}）`, href: `/grade?id=${testId}` }
+    : null;
+  useAutoSaveDraft(draftKey, draftMeta, draftValue, !restoring);
 
   // AIなしモードで、解答欄の切り出し画像を並べて見せるためのURL
   const cropUrls = useMemo(() => new Map((sheet?.crops ?? []).map((c) => [c.no, URL.createObjectURL(c.blob)])), [sheet]);
@@ -59,26 +119,29 @@ const Grade = () => {
 
   // 最初は未採点の一番若い番号（とその児童のまだの面）を選ぶ
   useEffect(() => {
-    if (studentNo === null && students && results && test) {
+    if (!restoring && studentNo === null && students && results && test) {
       const first = students.find((s) => !gradedNos.has(s.no)) ?? students[0];
       if (!first) return;
       setStudentNo(first.no);
       setSide(sides.find((x) => !doneSides(first.no).includes(x)) ?? "front");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [students, results, studentNo, test]);
+  }, [students, results, studentNo, test, restoring]);
 
   const reset = () => {
     if (source) URL.revokeObjectURL(source.url);
     if (sheet) URL.revokeObjectURL(sheet.url);
     setSource(null);
+    setSourceBlob(null);
     setSheet(null);
     setItems([]);
     setError("");
     setStage("photo");
+    setResumed(false);
+    clearDraft(draftKey);
   };
 
-  if (!test || !students || !results || !mode) return <p className="text-muted">読み込み中…</p>;
+  if (!test || !students || !results || !mode || restoring) return <p className="text-muted">読み込み中…</p>;
 
   if (!test.template || test.questions.some((q) => !q.box) || (questionsOn(test, "back").length > 0 && !test.back))
     return (
@@ -95,6 +158,8 @@ const Grade = () => {
     reset();
     const loaded = await loadSource(f);
     setSource(loaded);
+    // 続きから再開できるように、縮小した写真を端末内に残しておく
+    setSourceBlob((await encodeJpeg(loaded.canvas, 0.9)).blob);
     // 四すみを自動で探す。見つからなければ前の児童の位置を引き継ぐ（同じ置き方で撮れば、ほぼ合わせ直し不要）
     const detected = detectQuad(loaded.canvas);
     if (detected) setQuad(detected);
@@ -128,6 +193,14 @@ const Grade = () => {
     // ピンぼけ・暗いなどの写真は、AIに送る前に撮り直しをすすめる（読み間違いと料金のむだを防ぐ）
     if (prepared.issues.length > 0) setStage("quality");
     else await send(prepared);
+  };
+
+  /** 丸付けの画面から、四すみの調整に戻る（つけた○✕は消える） */
+  const backToCorners = () => {
+    if (items.some((i) => i.byTeacher) && !confirm("つけた○✕は消えます。四すみの調整に戻りますか？")) return;
+    setItems([]);
+    setError("");
+    setStage("corners");
   };
 
   const setVerdict = (no: string, v: Verdict) => setItems((xs) => xs.map((x) => (x.no === no ? applyVerdict(x, v) : x)));
@@ -304,9 +377,19 @@ const Grade = () => {
                 label={source ? "撮り直す" : sides.length > 1 ? `${SIDE_LABEL[side]}面を撮影` : "答案を撮影"}
                 onPick={pick}
                 className={source ? "btn-ghost" : "btn-primary"}
+                retake={!!source}
               />
             </div>
           </div>
+
+          {resumed && stage !== "photo" && (
+            <p className="flex flex-wrap items-center gap-2 rounded-lg bg-accent/10 px-3 py-2 text-sm text-accent">
+              ↩ 前回の途中から再開しました。
+              <button className="ml-auto underline" onClick={reset}>
+                この答案をやめる
+              </button>
+            </p>
+          )}
 
           {stage === "corners" && source && (
             <div className="space-y-3">
@@ -330,9 +413,14 @@ const Grade = () => {
                 )}
               </p>
               {error && <p className="text-sm text-pen">{error}</p>}
-              <button className="btn-pen w-full text-lg" onClick={grade}>
-                {mode === "ai" ? "○ AIで採点する" : "○ 解答欄を切り出して丸付けへ"}
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <button className="btn-ghost" onClick={reset}>
+                  ← 戻る（撮る前に戻る）
+                </button>
+                <button className="btn-pen flex-1 text-lg" onClick={grade}>
+                  {mode === "ai" ? "○ AIで採点する" : "○ 解答欄を切り出して丸付けへ"}
+                </button>
+              </div>
             </div>
           )}
 
@@ -352,8 +440,11 @@ const Grade = () => {
                 <img src={sheet.url} alt="補正した答案" className="w-full rounded-xl border border-line" />
               </div>
               <div className="flex flex-wrap gap-2">
-                <PhotoInput label="撮り直す" onPick={pick} className="btn-primary flex-1" />
-                <button className="btn-ghost flex-1" onClick={() => send(sheet)}>
+                <button className="btn-ghost" onClick={() => setStage("corners")}>
+                  ← 四すみの調整に戻る
+                </button>
+                <PhotoInput label="撮り直す" onPick={pick} className="btn-primary" retake />
+                <button className="btn-ghost ml-auto" onClick={() => send(sheet)}>
                   このまま採点する
                 </button>
               </div>
@@ -397,6 +488,9 @@ const Grade = () => {
                 )}
               </div>
               <div className="space-y-3">
+                <button className="btn-ghost py-1 text-sm" onClick={backToCorners}>
+                  ← 四すみの調整に戻る
+                </button>
                 <div className="flex items-baseline gap-3">
                   <span className="font-bold text-pen" style={{ fontSize: "3rem", lineHeight: 1 }}>
                     {score}

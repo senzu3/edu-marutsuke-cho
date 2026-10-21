@@ -13,8 +13,9 @@ const Home = () => {
   const studentCount = useLiveQuery(() => db.students.count());
   const results = useLiveQuery(() => db.results.toArray());
   const [filter, setFilter] = useState<Subject | "all">("all");
+  const drafts = useLiveQuery(() => db.drafts.orderBy("key").toArray());
 
-  if (!tests || studentCount === undefined || !results) return null;
+  if (!tests || studentCount === undefined || !results || !drafts) return null;
 
   // 裏面があるテストは、表と裏の両方を採点した人数
   const gradedCount = (t: Test) => results.filter((r) => r.testId === t.id && gradedSides(t, r).length === sidesOf(t).length).length;
@@ -28,6 +29,28 @@ const Home = () => {
 
   return (
     <div className="space-y-6">
+      {drafts.length > 0 && (
+        <section className="card space-y-2 border-accent/40 bg-accent/5">
+          <h2 className="font-bold">↩ 途中の作業があります</h2>
+          <ul className="space-y-2">
+            {[...drafts]
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .map((d) => (
+                <li key={d.key} className="flex flex-wrap items-center gap-2">
+                  <span className="min-w-0 flex-1">
+                    {d.label}
+                    <span className="ml-2 text-xs text-muted">
+                      {new Date(d.updatedAt).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  </span>
+                  <Link href={d.href} className="btn-primary py-1.5 text-sm">
+                    続きから →
+                  </Link>
+                </li>
+              ))}
+          </ul>
+        </section>
+      )}
       <section className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">テスト一覧</h1>

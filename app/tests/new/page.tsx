@@ -8,6 +8,7 @@ import { PhotoInput } from "@/components/PhotoInput";
 import { type LabeledRect, RectEditor } from "@/components/RectEditor";
 import { kantenTotals } from "@/lib/analytics";
 import { requestExtractKey } from "@/lib/api-client";
+import { NEW_TEST_DRAFT_KEY, clearDraft, loadDraft, useAutoSaveDraft } from "@/lib/drafts";
 import { type AnswerFormat, getSetting, setSetting, KANTEN, KANTEN_SHORT, type Kanten, type Question, type Rect, SIDE_LABEL, type Side, db, sideOf } from "@/lib/db";
 import { FORMATS, inferFormat } from "@/lib/judge";
 import { SUBJECTS, type Subject } from "@/lib/subjects";
@@ -29,6 +30,7 @@ import {
 type SideState = {
   stage: "photo" | "corners" | "ready";
   source: SourceImage | null;
+  sourceBlob: Blob | null; // 続きから再開するために端末内に残す写真（縮小済み）
   quad: Quad;
   autoCorners: boolean;
   sheet: { canvas: HTMLCanvasElement; url: string } | null; // まっすぐに補正した模範解答
@@ -36,7 +38,34 @@ type SideState = {
 };
 type Draw = { kind: "mask" } | { kind: "box"; index: number } | null;
 
-const emptySide = (): SideState => ({ stage: "photo", source: null, quad: defaultQuad(), autoCorners: false, sheet: null, masks: [] });
+const emptySide = (): SideState => ({ stage: "photo", source: null, sourceBlob: null, quad: defaultQuad(), autoCorners: false, sheet: null, masks: [] });
+
+/** 登録の途中の状態（アプリを閉じても続きから再開する） */
+type SideDraft = Pick<SideState, "stage" | "sourceBlob" | "quad" | "autoCorners" | "masks">;
+type NewTestDraft = {
+  subject: Subject;
+  title: string;
+  questions: Question[];
+  active: Side;
+  answerKeys: Partial<Record<Side, Blob>>;
+  sides: Record<Side, SideDraft | null>;
+};
+
+/** 写真と四すみの位置から、まっすぐに補正した模範解答を作る */
+const makeSheet = (source: SourceImage, quad: Quad) =>
+  new Promise<{ canvas: HTMLCanvasElement; url: string }>((resolve, reject) => {
+    const canvas = warp(source.canvas, quad, TEMPLATE_WIDTH, estimateHeight(quad, source.canvas.width, source.canvas.height));
+    canvas.toBlob((b) => (b ? resolve({ canvas, url: URL.createObjectURL(b) }) : reject(new Error("画像を作れませんでした"))), "image/jpeg", 0.9);
+  });
+
+/** 保存しておいた途中の状態から、その面を作り直す */
+const restoreSide = async (d: SideDraft | null): Promise<SideState | null> => {
+  if (!d) return null;
+  if (!d.sourceBlob) return { ...emptySide(), masks: d.masks };
+  const source = await loadSource(d.sourceBlob);
+  const sheet = d.stage === "ready" ? await makeSheet(source, d.quad) : null;
+  return { ...d, stage: sheet ? "ready" : d.stage === "ready" ? "corners" : d.stage, source, sheet };
+};
 
 /** 名前欄を黒塗りした模範解答画像 */
 const maskedImage = (s: SideState) => {
@@ -60,9 +89,36 @@ const NewTest = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [subject, setSubject] = useState<Subject>("算数");
-  // 前回選んだ教科から始める
+  // 前回の途中の状態があれば、そこから再開する。なければ前回選んだ教科から始める
+  const [restoring, setRestoring] = useState(true);
+  const [resumed, setResumed] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
   useEffect(() => {
-    getSetting("lastSubject", "算数").then((v) => (SUBJECTS as readonly string[]).includes(v) && setSubject(v as Subject));
+    (async () => {
+      const draft = await loadDraft<NewTestDraft>(NEW_TEST_DRAFT_KEY);
+      if (draft) {
+        try {
+          const [front, back] = await Promise.all([restoreSide(draft.sides.front), restoreSide(draft.sides.back)]);
+          setSides({ front: front ?? emptySide(), back });
+          setSubject(draft.subject);
+          setTitle(draft.title);
+          setQuestions(draft.questions);
+          setAnswerKeys(draft.answerKeys);
+          const act = draft.active === "back" && back ? "back" : "front";
+          setActive(act);
+          // 表面の名前欄がまだなら、名前欄を囲むところから
+          const a = act === "back" ? back : front;
+          setDraw(a?.stage === "ready" && a.masks.length === 0 && act === "front" ? { kind: "mask" } : null);
+          setResumed(true);
+        } catch {
+          await clearDraft(NEW_TEST_DRAFT_KEY);
+        }
+      } else {
+        const v = await getSetting("lastSubject", "算数");
+        if ((SUBJECTS as readonly string[]).includes(v)) setSubject(v as Subject);
+      }
+      setRestoring(false);
+    })();
   }, []);
   const changeSubject = (next: Subject) => {
     // 自動で決めた答えの形は、新しい教科に合わせて決め直す（先生が手で選んだ形はそのまま）
@@ -78,6 +134,27 @@ const NewTest = () => {
   );
   useEffect(() => () => Object.values(answerKeyUrls).forEach((u) => u && URL.revokeObjectURL(u)), [answerKeyUrls]);
 
+  // 登録の途中の状態を、自動で端末内に保存する（撮影も問題の入力もまだなら保存しない）
+  const draftValue = useMemo<NewTestDraft | null>(() => {
+    if (sides.front?.stage === "photo" && !sides.back && questions.length === 0) return null;
+    const toDraft = (x: SideState | null): SideDraft | null =>
+      x && { stage: x.stage, sourceBlob: x.sourceBlob, quad: x.quad, autoCorners: x.autoCorners, masks: x.masks };
+    return { subject, title, questions, active, answerKeys, sides: { front: toDraft(sides.front), back: toDraft(sides.back) } };
+  }, [subject, title, questions, active, answerKeys, sides]);
+  useAutoSaveDraft(
+    NEW_TEST_DRAFT_KEY,
+    { label: `答案用紙の登録（${subject}${title.trim() ? `・${title.trim()}` : ""}）`, href: "/tests/new" },
+    draftValue,
+    !restoring && !discarding,
+  );
+
+  const startOver = async () => {
+    if (!confirm("登録の途中の内容を消して、最初からやり直しますか？")) return;
+    setDiscarding(true);
+    await clearDraft(NEW_TEST_DRAFT_KEY);
+    window.location.reload();
+  };
+
   const cur = sides[active];
   const patchSide = (side: Side, patch: Partial<SideState>) => setSides((s) => ({ ...s, [side]: { ...s[side]!, ...patch } }));
   const hasBack = sides.back !== null;
@@ -92,10 +169,15 @@ const NewTest = () => {
   };
 
   const pick = async (f: File) => {
+    // まっすぐにしたあと（名前欄や解答欄の枠を描いたあと）に撮り直すと、その面の枠は描き直しになる
+    const drawn = (cur?.masks.length ?? 0) + onSide(active).filter((q) => q.box).length;
+    if (cur?.stage === "ready" && drawn > 0 && !confirm(`${SIDE_LABEL[active]}面を撮り直すと、名前欄と解答欄の枠は描き直しになります（正答などの入力はそのまま残ります）。撮り直しますか？`)) return;
     if (cur?.source) URL.revokeObjectURL(cur.source.url);
+    if (cur?.sheet) URL.revokeObjectURL(cur.sheet.url);
     const loaded = await loadSource(f);
     const detected = detectQuad(loaded.canvas);
-    patchSide(active, { source: loaded, quad: detected ?? defaultQuad(), autoCorners: !!detected, stage: "corners", masks: [] });
+    const { blob: sourceBlob } = await encodeJpeg(loaded.canvas, 0.9);
+    patchSide(active, { source: loaded, sourceBlob, sheet: null, quad: detected ?? defaultQuad(), autoCorners: !!detected, stage: "corners", masks: [] });
     // 用紙を撮り直すと大きさが変わるので、その面の解答用紙も登録し直してもらう
     setAnswerKeys(({ [active]: _drop, ...rest }) => rest);
     // 撮り直した面の解答欄の枠は位置が変わるので消す
@@ -103,14 +185,20 @@ const NewTest = () => {
     setError("");
   };
 
-  const straighten = () => {
+  const straighten = async () => {
     if (!cur?.source) return;
-    const { source, quad } = cur;
-    const canvas = warp(source.canvas, quad, TEMPLATE_WIDTH, estimateHeight(quad, source.canvas.width, source.canvas.height));
     if (cur.sheet) URL.revokeObjectURL(cur.sheet.url);
     const side = active;
-    canvas.toBlob((b) => b && patchSide(side, { sheet: { canvas, url: URL.createObjectURL(b) }, stage: "ready" }), "image/jpeg", 0.9);
+    patchSide(side, { sheet: await makeSheet(cur.source, cur.quad), stage: "ready" });
     setDraw(cur.masks.length === 0 ? { kind: "mask" } : null);
+  };
+
+  /** 四すみの調整から戻る：まっすぐにしたことがあればその画面へ、なければ撮る前へ */
+  const backFromCorners = () => {
+    if (!cur) return;
+    if (cur.sheet) return patchSide(active, { stage: "ready" });
+    if (cur.source) URL.revokeObjectURL(cur.source.url);
+    patchSide(active, { stage: "photo", source: null, sourceBlob: null });
   };
 
   const extract = async () => {
@@ -217,6 +305,8 @@ const NewTest = () => {
         ? { back: { masks: back.masks, template: { width: back.sheet!.canvas.width, height: back.sheet!.canvas.height, image: (await maskedImage(back)).blob } } }
         : {}),
     });
+    setDiscarding(true);
+    await clearDraft(NEW_TEST_DRAFT_KEY);
     router.push(`/grade?id=${id}`);
   };
 
@@ -237,8 +327,18 @@ const NewTest = () => {
   const total = questions.reduce((s, q) => s + q.points, 0);
   const sidesReady = (["front", "back"] as const).filter((s) => sides[s]?.stage === "ready");
 
+  if (restoring) return <p className="text-muted">読み込み中…</p>;
+
   return (
     <div className="space-y-6">
+      {resumed && (
+        <p className="flex flex-wrap items-center gap-2 rounded-lg bg-accent/10 px-3 py-2 text-sm text-accent">
+          ↩ 前回の登録の途中から再開しました。
+          <button className="ml-auto underline" onClick={startOver}>
+            最初からやり直す
+          </button>
+        </p>
+      )}
       <div>
         <h1 className="text-2xl font-bold">答案用紙を登録</h1>
         <p className="text-sm text-muted">最初に1回登録すれば、あとは児童の答案を撮るだけで、解答欄ごとに切り出して採点します。裏面があるテストは、表と裏の両方を登録します。</p>
@@ -292,9 +392,12 @@ const NewTest = () => {
             </button>
           )}
           {cur?.stage === "ready" && (
-            <button className="btn-ghost ml-auto py-1 text-sm" onClick={() => patchSide(active, { stage: "corners" })}>
-              四すみを合わせ直す
-            </button>
+            <span className="ml-auto flex flex-wrap gap-2">
+              <button className="btn-ghost py-1 text-sm" onClick={() => patchSide(active, { stage: "corners" })}>
+                四すみを合わせ直す
+              </button>
+              <PhotoInput label="撮り直す" onPick={pick} className="btn-ghost py-1 text-sm" retake />
+            </span>
           )}
         </div>
 
@@ -304,7 +407,7 @@ const NewTest = () => {
               <div className="space-y-2">
                 <h2 className="font-bold">{SIDE_LABEL[active]}面の模範解答（答えを書き込んだテスト）を撮影</h2>
                 <p className="text-sm text-muted">用紙全体が写るように、なるべく真上から撮ってください。</p>
-                <PhotoInput label="撮影 / 画像を選ぶ" onPick={pick} className="btn-primary" />
+                <PhotoInput label="カメラで撮る" onPick={pick} className="btn-primary" />
               </div>
             )}
 
@@ -312,7 +415,7 @@ const NewTest = () => {
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="font-bold">{SIDE_LABEL[active]}面：用紙の四すみを合わせる</h2>
-                  <PhotoInput label="撮り直す" onPick={pick} className="btn-ghost ml-auto py-1 text-sm" />
+                  <PhotoInput label="撮り直す" onPick={pick} className="btn-ghost py-1 text-sm" retake wrapClassName="ml-auto" />
                 </div>
                 <div className="mx-auto max-w-xl">
                   <CornerEditor imageUrl={cur.source.url} quad={cur.quad} onChange={(quad) => patchSide(active, { quad })} />
@@ -320,9 +423,14 @@ const NewTest = () => {
                 <p className={`text-sm ${cur.autoCorners ? "text-ok" : "text-review"}`}>
                   {cur.autoCorners ? "✓ 用紙の四すみを自動で見つけました。ずれていたら丸を動かしてください。" : "用紙の四すみを自動で見つけられませんでした。丸を動かして合わせてください。"}
                 </p>
-                <button className="btn-primary" onClick={straighten}>
-                  まっすぐにする →
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button className="btn-ghost" onClick={backFromCorners}>
+                    ← 戻る
+                  </button>
+                  <button className="btn-primary" onClick={straighten}>
+                    まっすぐにする →
+                  </button>
+                </div>
               </div>
             )}
 

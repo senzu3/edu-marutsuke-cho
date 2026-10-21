@@ -101,12 +101,19 @@ export type Result = {
 
 export type Setting = { key: string; value: string };
 
+/**
+ * 作業の途中の状態（アプリを閉じても続きから再開するため）。端末の中だけに保存し、バックアップには含めない。
+ * key は "grade:テストのID" または "newTest"
+ */
+export type Draft = { key: string; label: string; href: string; updatedAt: number; data: unknown };
+
 export const db = new Dexie("marutsuke") as Dexie & {
   students: EntityTable<Student, "no">;
   tests: EntityTable<Test, "id">;
   results: EntityTable<Result, "id">;
   settings: EntityTable<Setting, "key">;
   crops: EntityTable<Crop, "id">;
+  drafts: EntityTable<Draft, "key">;
 };
 
 db.version(1).stores({
@@ -118,6 +125,10 @@ db.version(1).stores({
 
 db.version(2).stores({
   crops: "++id, testId, [testId+studentNo], [testId+no]",
+});
+
+db.version(3).stores({
+  drafts: "key",
 });
 
 export const MODELS = [
@@ -191,8 +202,8 @@ export const importAll = async (data: Awaited<ReturnType<typeof exportAll>>) => 
       ...(back ? { back: { ...back, template: await templateFromBackup(back.template) } } : {}),
     })),
   );
-  await db.transaction("rw", [db.students, db.tests, db.results, db.crops], async () => {
-    await Promise.all([db.students.clear(), db.tests.clear(), db.results.clear(), db.crops.clear()]);
+  await db.transaction("rw", [db.students, db.tests, db.results, db.crops, db.drafts], async () => {
+    await Promise.all([db.students.clear(), db.tests.clear(), db.results.clear(), db.crops.clear(), db.drafts.clear()]);
     await db.students.bulkPut(data.students);
     await db.tests.bulkPut(tests);
     await db.results.bulkPut(data.results);
@@ -200,6 +211,6 @@ export const importAll = async (data: Awaited<ReturnType<typeof exportAll>>) => 
 };
 
 export const deleteAll = () =>
-  db.transaction("rw", [db.students, db.tests, db.results, db.settings, db.crops], () =>
-    Promise.all([db.students.clear(), db.tests.clear(), db.results.clear(), db.settings.clear(), db.crops.clear()]),
+  db.transaction("rw", [db.students, db.tests, db.results, db.settings, db.crops, db.drafts], () =>
+    Promise.all([db.students.clear(), db.tests.clear(), db.results.clear(), db.settings.clear(), db.crops.clear(), db.drafts.clear()]),
   );

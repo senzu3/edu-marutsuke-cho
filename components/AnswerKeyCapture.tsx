@@ -51,6 +51,7 @@ export const AnswerKeyCapture = ({ width, height, currentUrl, onCapture, onRemov
           <button className="btn-primary" onClick={done}>
             まっすぐにして登録
           </button>
+          <PhotoInput label="撮り直す" onPick={pick} className="btn-ghost" retake />
           <button
             className="btn-ghost"
             onClick={() => {
@@ -58,7 +59,7 @@ export const AnswerKeyCapture = ({ width, height, currentUrl, onCapture, onRemov
               setSource(null);
             }}
           >
-            やめる
+            ← やめる
           </button>
         </div>
       </div>
@@ -71,7 +72,7 @@ export const AnswerKeyCapture = ({ width, height, currentUrl, onCapture, onRemov
         <img src={currentUrl} alt="登録した解答用紙" className="h-28 rounded-lg border border-line object-contain" />
       )}
       <div className="flex flex-wrap gap-2">
-        <PhotoInput label={currentUrl ? "撮り直す" : "解答用紙を撮影"} onPick={pick} className={currentUrl ? "btn-ghost text-sm" : "btn-primary text-sm"} />
+        <PhotoInput label={currentUrl ? "撮り直す" : "解答用紙を撮影"} onPick={pick} className={currentUrl ? "btn-ghost text-sm" : "btn-primary text-sm"} retake={!!currentUrl} />
         {currentUrl && onRemove && (
           <button className="btn-ghost text-sm" onClick={onRemove}>
             登録を外す
