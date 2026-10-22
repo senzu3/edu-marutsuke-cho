@@ -1,6 +1,6 @@
 import type { Workbook, Worksheet } from "exceljs";
 import { type AbcThresholds, abcOf, kantenStats, kantenTotals, loadAbc, tagStats } from "./analytics";
-import { KANTEN_SHORT, type Result, type Student, type Test, db, itemPoints } from "./db";
+import { KANTEN_SHORT, type Result, type Student, type Test, db, gradedSides, itemPoints, sidesOf } from "./db";
 import { SUBJECTS, type Subject, subjectOf } from "./subjects";
 import { isUnjudged } from "./grading";
 
@@ -72,8 +72,13 @@ const styleHeader = (ws: Worksheet, rowNo: number) => {
 const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results: Result[], withNames: boolean) => {
   const qs = test.questions;
   const totals = kantenTotals(qs);
+  // 丸付け済みの答案から合計点を読み取った児童がいれば、「答案の合計点」の列を入れる
+  const hasWritten = results.some((r) => r.writtenScore !== undefined);
+  const mismatch = (r: Result) =>
+    r.writtenScore !== undefined && gradedSides(test, r).length === sidesOf(test).length && r.writtenScore !== r.score;
   const lead = [
     ...(withNames ? ["番号", "氏名", "得点", "満点", "得点率"] : ["番号", "得点", "満点", "得点率"]),
+    ...(hasWritten ? ["答案の合計点"] : []),
     ...totals.map((t) => `${KANTEN_SHORT[t.kanten]}（${t.points}点）`),
   ];
   const first = lead.length + 1; // 問題の列が始まる位置（1始まり）
@@ -107,8 +112,21 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
         return q?.kanten === t.kanten ? sum + itemPoints(i, q.points) : sum;
       }, 0),
     );
-    const row = ws.addRow([...base, r.score, r.total, r.total ? r.score / r.total : 0, ...kantenScores]);
+    const row = ws.addRow([
+      ...base,
+      r.score,
+      r.total,
+      r.total ? r.score / r.total : 0,
+      ...(hasWritten ? [r.writtenScore ?? ""] : []),
+      ...kantenScores,
+    ]);
     row.getCell(base.length + 3).numFmt = "0%";
+    // 書かれた合計点が、○✕から計算した得点と合わないときは赤字にする
+    if (mismatch(r)) {
+      const c = row.getCell(base.length + 4);
+      c.font = { bold: true, color: RED };
+      c.note = `○✕から計算した得点（${r.score}点）と合いません`;
+    }
     qs.forEach((q, i) => {
       const m = mark(r.items.find((x) => x.no === q.no));
       const cell = row.getCell(first + i);
@@ -135,6 +153,7 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
     ...Array(rateCol - 2).fill(""),
     "正答率・平均",
     avg,
+    ...(hasWritten ? [""] : []),
     ...kantenAvg,
     ...qs.map((q) => {
       const items = graded.flatMap((r) => r.items.filter((i) => i.no === q.no));
@@ -149,9 +168,20 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
   });
   rateRow.getCell(rateCol - 1).alignment = { horizontal: "right" };
 
+  if (hasWritten) {
+    const off = graded.filter(mismatch).map((r) => `${r.studentNo}番`);
+    ws.addRow([]);
+    ws.addRow([
+      off.length
+        ? `赤字の「答案の合計点」は、○✕から計算した得点と合いません（${off.join("、")}）。○✕△と配点を確認してください。`
+        : "「答案の合計点」は、丸付け済みの答案に先生が書いた合計点を読み取ったものです。",
+    ]).font = { color: off.length ? RED : GRAY };
+  }
+
   ws.getColumn(1).width = 6;
   if (withNames) ws.getColumn(2).width = 14;
   for (let c = withNames ? 3 : 2; c <= lead.length; c++) ws.getColumn(c).width = c > lead.length - totals.length ? 14 : 8;
+  if (hasWritten) ws.getColumn(rateCol + 1).width = 13;
   qs.forEach((q, i) => (ws.getColumn(first + i).width = Math.min(18, Math.max(7, q.tag.length * 1.8, q.answer.length * 1.4))));
   ws.views = [{ state: "frozen", xSplit: withNames ? 2 : 1, ySplit: headerRow }];
 };
