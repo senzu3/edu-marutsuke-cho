@@ -1,4 +1,4 @@
-import type { Workbook, Worksheet } from "exceljs";
+import type { Cell, Workbook, Worksheet } from "exceljs";
 import { type AbcThresholds, abcOf, kantenStats, kantenTotals, loadAbc, tagStats } from "./analytics";
 import { KANTEN_SHORT, type Result, type Student, type Test, db, gradedSides, itemPoints, sidesOf } from "./db";
 import { SUBJECTS, type Subject, subjectOf } from "./subjects";
@@ -69,7 +69,17 @@ const styleHeader = (ws: Worksheet, rowNo: number) => {
   });
 };
 
-const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results: Result[], withNames: boolean) => {
+/** テストのシートのどこに何を書いたか（先生が書き足したメモを、作り直したあとも同じ場所に戻すため） */
+type TestSheetLayout = {
+  lastCol: number; // 表のいちばん右の列
+  topRows: Map<string, number>; // 表の上の行（題名・単元・正答・配点など）
+  headerRow: number;
+  studentRows: Map<number, number>; // 出席番号 → 行
+  rateRow: number; // 「正答率・平均」の行
+  endRow: number; // アプリが書いたいちばん下の行
+};
+
+const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results: Result[], withNames: boolean): TestSheetLayout => {
   const qs = test.questions;
   const totals = kantenTotals(qs);
   // 丸付け済みの答案から合計点を読み取った児童がいれば、「答案の合計点」の列を入れる
@@ -83,9 +93,14 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
   ];
   const first = lead.length + 1; // 問題の列が始まる位置（1始まり）
 
-  ws.addRow([test.title, `${subjectOf(test)}・登録日 ${date(test.createdAt)}`]).font = { bold: true, size: 13 };
+  const topRows = new Map<string, number>();
+  const studentRows = new Map<number, number>();
+  const titleRow = ws.addRow([test.title, `${subjectOf(test)}・登録日 ${date(test.createdAt)}`]);
+  titleRow.font = { bold: true, size: 13 };
+  topRows.set(TITLE_KEY, titleRow.number);
   const info = (label: string, values: (string | number)[]) => {
     const row = ws.addRow([...Array(lead.length - 1).fill(""), label, ...values]);
+    topRows.set(label, row.number);
     row.getCell(lead.length).font = { bold: true, color: GRAY };
     row.alignment = { horizontal: "center" };
   };
@@ -104,6 +119,7 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
     if (!r) {
       const row = ws.addRow([...base, "未採点"]);
       row.getCell(base.length + 1).font = { color: GRAY };
+      studentRows.set(s.no, row.number);
       continue;
     }
     const kantenScores = totals.map((t) =>
@@ -121,6 +137,7 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
       ...kantenScores,
     ]);
     row.getCell(base.length + 3).numFmt = "0%";
+    studentRows.set(s.no, row.number);
     // 書かれた合計点が、○✕から計算した得点と合わないときは赤字にする
     if (mismatch(r)) {
       const c = row.getCell(base.length + 4);
@@ -168,14 +185,16 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
   });
   rateRow.getCell(rateCol - 1).alignment = { horizontal: "right" };
 
+  let endRow = rateRow.number;
   if (hasWritten) {
     const off = graded.filter(mismatch).map((r) => `${r.studentNo}番`);
     ws.addRow([]);
-    ws.addRow([
+    endRow = ws.addRow([
       off.length
         ? `赤字の「答案の合計点」は、○✕から計算した得点と合いません（${off.join("、")}）。○✕△と配点を確認してください。`
-        : "「答案の合計点」は、丸付け済みの答案に先生が書いた合計点を読み取ったものです。",
-    ]).font = { color: off.length ? RED : GRAY };
+        : WRITTEN_NOTE,
+    ]).number;
+    ws.getRow(endRow).font = { color: off.length ? RED : GRAY };
   }
 
   ws.getColumn(1).width = 6;
@@ -184,6 +203,125 @@ const writeTestSheet = (ws: Worksheet, test: Test, students: Student[], results:
   if (hasWritten) ws.getColumn(rateCol + 1).width = 13;
   qs.forEach((q, i) => (ws.getColumn(first + i).width = Math.min(18, Math.max(7, q.tag.length * 1.8, q.answer.length * 1.4))));
   ws.views = [{ state: "frozen", xSplit: withNames ? 2 : 1, ySplit: headerRow }];
+  return { lastCol: first + qs.length - 1, topRows, headerRow, studentRows, rateRow: rateRow.number, endRow };
+};
+
+// ---- 先生がテストのシートに書き足したメモを残す ----
+
+const TITLE_KEY = "__title";
+const WRITTEN_NOTE = "「答案の合計点」は、丸付け済みの答案に先生が書いた合計点を読み取ったものです。";
+const WRITTEN_WARN = "赤字の「答案の合計点」は";
+
+type CellSnap = { col: number; value: Cell["value"]; style: Cell["style"]; note?: Cell["note"] };
+/** 前のファイルのテストのシートから取り出した、先生が書き足した部分 */
+type KeptNotes = {
+  rows: Map<string, CellSnap[]>; // 表の右側（col は表の右端からいくつ目か）。題名の行だけは列の位置そのまま
+  below: { offset: number; cells: CellSnap[] }[]; // 表の下（offset は表の下端から何行目か。col は列の位置そのまま）
+  widths: Map<number, number>; // 表の右側の列幅（右端からいくつ目か → 幅）
+};
+
+const text = (c: Cell) => (c.value === null || c.value === undefined ? "" : String(c.text ?? "").trim());
+const snap = (c: Cell, col: number): CellSnap => ({
+  col,
+  value: c.value,
+  style: JSON.parse(JSON.stringify(c.style ?? {})),
+  ...(c.note ? { note: c.note } : {}),
+});
+const cellsOf = (ws: Worksheet, rowNo: number, fromCol: number, toCol = Infinity) => {
+  const out: Cell[] = [];
+  ws.getRow(rowNo).eachCell({ includeEmpty: false }, (c, col) => {
+    if (col >= fromCol && col <= toCol && (text(c) || c.note)) out.push(c);
+  });
+  return out;
+};
+
+/** 前のファイルのテストのシートから、先生が書き足したセル（表の右側・表の下・題名の横）を取り出す */
+const keepTeacherNotes = (ws: Worksheet): KeptNotes | null => {
+  let headerRow = 0;
+  for (let r = 1; r <= Math.min(ws.rowCount, 40) && !headerRow; r++) if (text(ws.getCell(r, 1)) === "番号") headerRow = r;
+  if (!headerRow) return null;
+  // 表の右端：アプリが色を付けた見出しのいちばん右（先生が見出しを書き足しても、色がなければ表の外とみなす）
+  let lastCol = 0;
+  ws.getRow(headerRow).eachCell({ includeEmpty: false }, (c, col) => {
+    const fill = c.fill as { fgColor?: { argb?: string } } | undefined;
+    if (fill?.fgColor?.argb === HEADER_FILL.fgColor.argb) lastCol = Math.max(lastCol, col);
+  });
+  if (!lastCol) return null;
+
+  const rows = new Map<string, CellSnap[]>();
+  const add = (key: string, cells: CellSnap[]) => cells.length && rows.set(key, [...(rows.get(key) ?? []), ...cells]);
+  // 表の上の行：題名の行は3列目から、ほかは表の右側
+  for (let r = 1; r < headerRow; r++) {
+    if (r === 1) add(TITLE_KEY, cellsOf(ws, 1, 3).map((c) => snap(c, Number(c.col))));
+    else {
+      const label = cellsOf(ws, r, 1, lastCol).map(text)[0];
+      if (label) add(`top:${label}`, cellsOf(ws, r, lastCol + 1).map((c) => snap(c, Number(c.col) - lastCol)));
+    }
+  }
+  add("header", cellsOf(ws, headerRow, lastCol + 1).map((c) => snap(c, Number(c.col) - lastCol)));
+
+  // 児童の行（出席番号で対応させる）と、「正答率・平均」の行
+  let rateRow = 0;
+  for (let r = headerRow + 1; r <= ws.rowCount && !rateRow; r++) {
+    const inTable = cellsOf(ws, r, 1, lastCol).map(text);
+    if (inTable.includes("正答率・平均")) rateRow = r;
+    const no = Number(text(ws.getCell(r, 1)));
+    const key = rateRow ? "rate" : Number.isInteger(no) && no > 0 && text(ws.getCell(r, 1)) !== "" ? `s:${no}` : null;
+    if (key) add(key, cellsOf(ws, r, lastCol + 1).map((c) => snap(c, Number(c.col) - lastCol)));
+  }
+  if (!rateRow) return null;
+  // アプリが書いた説明の行（答案の合計点）までを表とみなし、その下は先生が書いたものとして残す
+  let endRow = rateRow;
+  const noteRow = text(ws.getCell(rateRow + 2, 1));
+  if (noteRow.startsWith(WRITTEN_WARN) || noteRow === WRITTEN_NOTE) endRow = rateRow + 2;
+  const below: KeptNotes["below"] = [];
+  for (let r = endRow + 1; r <= ws.rowCount; r++) {
+    const cells = cellsOf(ws, r, 1).map((c) => snap(c, Number(c.col)));
+    if (cells.length) below.push({ offset: r - endRow, cells });
+  }
+
+  const widths = new Map<number, number>();
+  for (let c = lastCol + 1; c <= ws.columnCount; c++) {
+    const w = ws.getColumn(c).width;
+    if (w) widths.set(c - lastCol, w);
+  }
+  return { rows, below, widths };
+};
+
+/** 取り出しておいたメモを、作り直したシートの同じ場所（同じ児童の行・表の右側・表の下）に戻す */
+const restoreTeacherNotes = (ws: Worksheet, kept: KeptNotes, layout: TestSheetLayout) => {
+  const put = (row: number, col: number, s: CellSnap) => {
+    const c = ws.getCell(row, col);
+    c.value = s.value;
+    c.style = s.style;
+    if (s.note) c.note = s.note;
+  };
+  const rowOf = (key: string) => {
+    if (key === TITLE_KEY) return layout.topRows.get(TITLE_KEY);
+    if (key === "header") return layout.headerRow;
+    if (key === "rate") return layout.rateRow;
+    if (key.startsWith("top:")) return layout.topRows.get(key.slice(4));
+    if (key.startsWith("s:")) return layout.studentRows.get(Number(key.slice(2)));
+  };
+  const orphans: CellSnap[][] = []; // 名簿から外れた児童の行のメモ（表の下に残す）
+  for (const [key, cells] of kept.rows) {
+    const row = rowOf(key);
+    if (!row) {
+      orphans.push(cells);
+      continue;
+    }
+    for (const s of cells) put(row, key === TITLE_KEY ? s.col : layout.lastCol + s.col, s);
+  }
+  let last = layout.endRow;
+  for (const b of kept.below) {
+    last = layout.endRow + b.offset;
+    for (const s of b.cells) put(last, s.col, s);
+  }
+  for (const cells of orphans) {
+    last += 1;
+    for (const s of cells) put(last, layout.lastCol + s.col, s);
+  }
+  for (const [offset, w] of kept.widths) ws.getColumn(layout.lastCol + offset).width = w;
 };
 
 const writeSummarySheet = (ws: Worksheet, subject: Subject, tests: Test[], students: Student[], results: Result[], withNames: boolean) => {
@@ -318,7 +456,12 @@ export const buildExcel = async ({ withNames, base }: { withNames: boolean; base
     if (rs.length === 0) continue; // まだ採点していないテストは書き出さない
     const name = names.get(t.id!)!;
     (before.has(name.toLowerCase()) ? updated : added).push(name);
-    writeTestSheet(freshSheet(wb, name), t, students, rs, withNames);
+    // 前のファイルの同じテストのシートに先生が書き足したメモは、作り直したあとも残す
+    const old = wb.worksheets.find((w) => w.name.toLowerCase() === name.toLowerCase());
+    const kept = old ? keepTeacherNotes(old) : null;
+    const ws = freshSheet(wb, name);
+    const layout = writeTestSheet(ws, t, students, rs, withNames);
+    if (kept) restoreTeacherNotes(ws, kept, layout);
   }
 
   const buf = await wb.xlsx.writeBuffer();
