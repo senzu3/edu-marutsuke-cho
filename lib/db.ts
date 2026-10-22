@@ -82,6 +82,7 @@ export type ResultItem = {
   x: number | null; // ○×を描く位置（正規化座標）
   y: number | null;
   errorType: string; // 誤答の傾向（AIの推定）
+  teacherMark?: string; // 丸付け済みの答案から読み取った先生の印（○✕△なし）
 };
 
 /** 解答欄の切り出し画像（問題ごとの横並び採点用。採点完了時に削除できる） */

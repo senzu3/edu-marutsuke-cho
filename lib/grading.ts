@@ -1,4 +1,4 @@
-import { requestGrade } from "./api-client";
+import { type TeacherMark, requestGrade, requestReadMarks } from "./api-client";
 import { type ModelId, type Question, type ResultItem, type Side, type Test, calcScore, db, sheetOf, sideOf } from "./db";
 import { formatHint, isAccepted, judge, markPosition, sameAs } from "./judge";
 import type { Subject } from "./subjects";
@@ -14,16 +14,25 @@ export type PreparedSheet = {
 /** その面にある問題 */
 export const questionsOn = (test: Test, side: Side) => test.questions.filter((q) => sideOf(q) === side);
 
-/** 答案写真（表または裏）をテンプレートに合わせて補正し、名前欄を塗りつぶしてから、その面の解答欄ごとに切り出す */
-export const prepareSheet = async (source: SourceImage, quad: Quad, test: Test, side: Side): Promise<PreparedSheet> => {
+/**
+ * 答案の種類：まだ丸付けしていない答案（児童の答えを読み取って判定する）／
+ * 先生が丸付け済みの答案（先生が付けた○✕△を読み取ってデータにする）
+ */
+export type SheetKind = "blank" | "marked";
+
+/**
+ * 答案写真（表または裏）をテンプレートに合わせて補正し、名前欄を塗りつぶしてから、その面の解答欄ごとに切り出す。
+ * 丸付け済みの答案は、欄のそばに付いた先生の印も入るように広めに、色つきのまま切り出す（赤い印を見分けるため）
+ */
+export const prepareSheet = async (source: SourceImage, quad: Quad, test: Test, side: Side, kind: SheetKind = "blank"): Promise<PreparedSheet> => {
   const { template, masks } = sheetOf(test, side)!;
   const canvas = warp(source.canvas, quad, template.width, template.height);
   blackout(canvas, masks); // 切り出しより先に塗る：解答欄が名前欄に重なっていても名前は出ない
   const crops = await Promise.all(
     questionsOn(test, side).map(async (q) => {
-      const crop = cropBox(canvas, q.box!);
+      const crop = cropBox(canvas, q.box!, kind === "marked" ? 0.3 : 0.12);
       const { blob } = await encodeJpeg(crop, 0.9);
-      const { base64 } = await encodeJpeg(enhanceCrop(crop), 0.9);
+      const { base64 } = await encodeJpeg(kind === "marked" ? crop : enhanceCrop(crop), 0.9);
       return { no: q.no, base64, blob };
     }),
   );
@@ -40,6 +49,31 @@ export const gradeSheet = async (sheet: PreparedSheet, questions: Question[], mo
   );
   const byNo = new Map(res.answers.map((a) => [a.no, a]));
   return questions.map((q) => judge(q, byNo.get(q.no), markPosition(q)));
+};
+
+/** 丸付け済みの答案：AIが先生の印（○✕△）を読み取り、そのまま採点結果にする。読み取りに迷う問題は「要確認」 */
+export const readMarksSheet = async (sheet: PreparedSheet, questions: Question[], model: ModelId, subject: Subject): Promise<ResultItem[]> => {
+  const res = await requestReadMarks(
+    questions.map((q) => ({ no: q.no, image: sheet.crops.find((c) => c.no === q.no)!.base64, hint: `配点${q.points}点` })),
+    model,
+    subject,
+  );
+  const byNo = new Map(res.marks.map((m) => [m.no, m]));
+  return questions.map((q) => markItem(q, byNo.get(q.no)?.mark ?? "なし", byNo.get(q.no)?.points ?? null, byNo.get(q.no)?.clear ?? false));
+};
+
+/** 先生の印1つを採点結果にする */
+const markItem = (q: Question, mark: TeacherMark, points: number | null, clear: boolean): ResultItem => {
+  const base = { no: q.no, studentAnswer: "", teacherMark: mark, ...(markPosition(q) ?? { x: null, y: null }), errorType: "" };
+  const review = (reason: string): ResultItem => ({ ...base, correct: mark === "○", confidence: 0.4, needsReview: true, reasons: [reason] });
+  if (mark === "なし") return review("先生の採点の印が見つかりません");
+  if (!clear) return review(`先生の印が読みにくい（${mark}と読みました）`);
+  if (mark === "△") {
+    // 得点が書いてあり、配点の範囲に収まっていれば部分点に。なければ先生に点数をたずねる
+    if (points !== null && points > 0 && points < q.points) return { ...base, correct: false, earned: points, confidence: 0.8, needsReview: false };
+    return review("△（部分点）：点数を確認してください");
+  }
+  return { ...base, correct: mark === "○", confidence: 0.9, needsReview: false };
 };
 
 export const UNJUDGED = "未判定";

@@ -106,7 +106,8 @@ const Review = () => {
     const map = new Map<string, Entry[]>();
     for (const e of entries.filter((x) => x.item.no === selectedNo)) {
       // AIなしの答えは読み取った文字がないので、「未判定」「○にした」「✕にした」でまとめる
-      const key = isManual(e.item) ? manualGroup(e.item) : normalize(e.item.studentAnswer);
+      // 丸付け済みの答案から読んだ結果は、読み取った先生の印でまとめる
+      const key = isManual(e.item) ? manualGroup(e.item) : e.item.teacherMark ? `mark:${e.item.teacherMark}` : normalize(e.item.studentAnswer);
       map.set(key, [...(map.get(key) ?? []), e]);
     }
     const rank = (es: Entry[]) => (es.some((e) => isUnjudged(e.item)) ? -1 : es.some((e) => e.item.needsReview) ? 0 : es.some((e) => !e.item.correct) ? 1 : 2);
@@ -172,10 +173,16 @@ const Review = () => {
                   {isUnjudged(e.item) ? (
                     <p className="text-muted">AIなし：画像を見て判定してください</p>
                   ) : (
+                  e.item.teacherMark ? (
+                  <p>
+                    読み取った先生の印：<b>{e.item.teacherMark}</b>
+                  </p>
+                  ) : (
                   <p>
                     読み取り：<b>{e.item.studentAnswer || "（空欄）"}</b>
                     {e.item.otherReading && <span className="text-muted">（または「{e.item.otherReading}」）</span>}
                   </p>
+                  )
                   )}
                   <p className="text-muted">
                     {answerOf(e.item.no)?.format === "essay" ? "模範解答" : "正答"}：{answerOf(e.item.no)?.answer}
@@ -224,11 +231,12 @@ const Review = () => {
           {groups.map((group) => {
             const unjudged = isUnjudged(group[0].item);
             const manual = isManual(group[0].item);
-            const label = manual ? MANUAL_LABELS[manualGroup(group[0].item)] : group[0].item.studentAnswer || "（空欄）";
+            const mark = group[0].item.teacherMark;
+            const label = manual ? MANUAL_LABELS[manualGroup(group[0].item)] : mark ? `先生の印：${mark}` : group[0].item.studentAnswer || "（空欄）";
             return (
               <section key={label} className="card space-y-3 p-4">
                 <div className="flex flex-wrap items-center gap-3">
-                  <span className="text-lg font-bold">{manual ? label : `「${label}」`}</span>
+                  <span className="text-lg font-bold">{manual || mark ? label : `「${label}」`}</span>
                   <span className="text-sm text-muted">{group.length}人</span>
                   <span className="ml-auto text-sm text-muted">まとめて</span>
                   <JudgeButtons

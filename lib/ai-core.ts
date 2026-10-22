@@ -61,7 +61,20 @@ const TranscribeSchema = z.object({
   answers: z.array(z.object({ no: z.string(), text: z.string(), legible: z.boolean(), other_reading: z.string() })),
 });
 
+/** 採点済みの答案：先生が付けた印の読み取り結果 */
+const MarksSchema = z.object({
+  marks: z.array(
+    z.object({
+      no: z.string(),
+      mark: z.enum(["○", "✕", "△", "なし"]),
+      points: z.number().nullable(),
+      clear: z.boolean(),
+    }),
+  ),
+});
+
 export type KeyOutput = z.infer<typeof KeySchema>;
+export type MarksOutput = z.infer<typeof MarksSchema>;
 export type TranscribeOutput = z.infer<typeof TranscribeSchema>;
 
 const common = (subject: Subject) => `あなたは日本の小学校の${subject === "その他" ? "" : subject}テストの採点を手伝うアシスタントです。
@@ -98,6 +111,21 @@ const transcribePrompt = (subject: Subject) => `${common(subject)}
 - legible: はっきり読めるなら true。字がくずれている・消し跡と重なっている場合は false
 - other_reading: 字の形から別の読み方もありうる場合（例: 1と7、4と9、0と6）、もう一方の読み。なければ空文字`;
 
+// 採点済みの答案：先生が付けた採点の印（○✕△）だけを読み取る。児童の答えの正誤はAIに判断させない
+const marksPrompt = (subject: Subject) => `${common(subject)}
+
+上の画像は、先生がすでに採点した児童のテストの解答欄を、まわりを少し広めに含めて切り出したものです。
+それぞれの画像の中央にある解答欄に、先生が（多くは赤で）付けた採点の印を読み取ってください。児童の答えが正しいかどうかは、あなたは判断しないでください。
+- no: 【解答欄 ○○｜…】の ○○
+- mark: 先生の印。
+  - "○": 正解の印（丸・二重丸・花丸）
+  - "✕": 不正解の印（バツ・斜線）。日本の採点では、チェック（レ点）も不正解の印として使われるので "✕" にする
+  - "△": 部分点の印（三角）
+  - "なし": 採点の印が見当たらない
+- points: 印のそばに、その問題の得点が数字で書かれていればその数（例: 「3」→ 3）。減点の書き方（「-2」など）や、数字がないときは null
+- clear: 印がはっきり読み取れるなら true。かすれている・となりの欄の印と重なっていて、どの欄の印か迷う場合は false
+画像の端に写っている、となりの解答欄の印は読まないでください。`;
+
 type UserContent = Anthropic.Beta.Messages.BetaContentBlockParam[];
 
 /** Claudeを呼び出して構造化出力を返す。画像や結果はサーバーに保存しない。 */
@@ -132,6 +160,10 @@ export const runExtractKey = (client: Anthropic, image: string, model: ModelId, 
 /** 解答欄を書き写す（AIは1回だけ） */
 export const runTranscribe = (client: Anthropic, items: GradeItem[], model: ModelId, subject: Subject) =>
   callClaude(client, model, [...cropBlocks(items), { type: "text", text: transcribePrompt(subject) }], TranscribeSchema);
+
+/** 採点済みの答案から、先生の印を読み取る（AIは1回だけ） */
+export const runReadMarks = (client: Anthropic, items: GradeItem[], model: ModelId, subject: Subject) =>
+  callClaude(client, model, [...cropBlocks(items), { type: "text", text: marksPrompt(subject) }], MarksSchema);
 
 /** エラーをユーザー向けの文に変換（内容はログに残さない）。keyHint はAPIキーの確認場所 */
 export const toUserError = (e: unknown, keyHint = ".env.local を確認") => {

@@ -1,6 +1,6 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
-import { type GradeItem, type KeyOutput, type ModelId, runExtractKey, runTranscribe } from "./ai-core";
+import { type GradeItem, type KeyOutput, type MarksOutput, type ModelId, runExtractKey, runReadMarks, runTranscribe } from "./ai-core";
 import type { Subject } from "./subjects";
 
 export { ExtractRequest, GradeRequest, toUserError } from "./ai-core";
@@ -122,3 +122,17 @@ export const transcribeAnswers = async (items: GradeItem[], model: ModelId, subj
   return runTranscribe(getClient(), items, model, subject);
 };
 
+/** 採点済みの答案から、先生の印を読み取る */
+export const readMarks = async (items: GradeItem[], model: ModelId, subject: Subject): Promise<MarksOutput> => {
+  if (DEMO) {
+    await demoDelay();
+    const marks = ["○", "○", "○", "✕", "△", "なし"] as const;
+    return {
+      marks: items.map((it) => {
+        const mark = marks[Math.floor(Math.random() * marks.length)];
+        return { no: it.no, mark, points: mark === "△" ? 1 : null, clear: Math.random() > 0.15 };
+      }),
+    };
+  }
+  return runReadMarks(getClient(), items, model, subject);
+};

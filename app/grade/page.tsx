@@ -14,7 +14,7 @@ import { allowsPartial, needsImage } from "@/lib/judge";
 import { subjectOf } from "@/lib/subjects";
 import { gradeDraftKey, clearDraft, loadDraft, useAutoSaveDraft } from "@/lib/drafts";
 import { type ResultItem, SIDE_LABEL, type Side, type Test, calcScore, db, getSetting, gradedSides, setSetting, sheetOf, sidesOf } from "@/lib/db";
-import { type PreparedSheet, type Verdict, applyVerdict, gradeSheet, isUnjudged, manualItems, prepareSheet, questionsOn, saveResult } from "@/lib/grading";
+import { type PreparedSheet, type SheetKind, type Verdict, applyVerdict, gradeSheet, isUnjudged, manualItems, prepareSheet, questionsOn, readMarksSheet, saveResult } from "@/lib/grading";
 import { useGradingMode, useKeepImages, useModel } from "@/lib/settings-hooks";
 import { QUALITY_MESSAGES, type Quad, type SourceImage, defaultQuad, detectQuad, encodeJpeg, loadSource } from "@/lib/warp";
 
@@ -31,6 +31,7 @@ type GradeDraft = {
   quad: Quad;
   autoCorners: boolean;
   items: ResultItem[];
+  kind?: SheetKind;
 };
 
 const Grade = () => {
@@ -45,8 +46,11 @@ const Grade = () => {
   const [studentNo, setStudentNo] = useState<number | null>(null);
   const [side, setSide] = useState<Side>("front");
   const [sideOrder, setSideOrder] = useState<SideOrder>("student");
+  // 答案の種類：まだ丸付けしていない答案／先生が丸付け済みの答案
+  const [sheetKind, setSheetKind] = useState<SheetKind>("blank");
   useEffect(() => {
     getSetting("sideOrder", "student").then((v) => setSideOrder(v === "side" ? "side" : "student"));
+    getSetting("sheetKind", "blank").then((v) => setSheetKind(v === "marked" ? "marked" : "blank"));
   }, []);
   const [stage, setStage] = useState<Stage>("photo");
   const [source, setSource] = useState<SourceImage | null>(null);
@@ -79,8 +83,9 @@ const Grade = () => {
         setSourceBlob(draft.source);
         setQuad(draft.quad);
         setAutoCorners(draft.autoCorners);
+        if (draft.kind) setSheetKind(draft.kind);
         if (draft.stage === "review") {
-          setSheet(await prepareSheet(loaded, draft.quad, test, draft.side));
+          setSheet(await prepareSheet(loaded, draft.quad, test, draft.side, draft.kind));
           setItems(draft.items);
         }
         setStage(draft.stage);
@@ -98,9 +103,9 @@ const Grade = () => {
   const draftValue = useMemo<GradeDraft | null>(
     () =>
       sourceBlob && studentNo !== null && stage !== "photo"
-        ? { studentNo, side, stage: stage === "review" ? "review" : "corners", source: sourceBlob, quad, autoCorners, items: stage === "review" ? items : [] }
+        ? { studentNo, side, stage: stage === "review" ? "review" : "corners", source: sourceBlob, quad, autoCorners, items: stage === "review" ? items : [], kind: sheetKind }
         : null,
-    [sourceBlob, studentNo, side, stage, quad, autoCorners, items],
+    [sourceBlob, studentNo, side, stage, quad, autoCorners, items, sheetKind],
   );
   const draftMeta = test && studentNo !== null
     ? { label: `${test.title}の採点（${studentNo}番${test.back ? `・${SIDE_LABEL[side]}面` : ""}）`, href: `/grade?id=${testId}` }
@@ -176,7 +181,8 @@ const Grade = () => {
     }
     setStage("grading");
     try {
-      setItems(await gradeSheet(prepared, questionsOn(test, side), model, subjectOf(test)));
+      const qs = questionsOn(test, side);
+      setItems(sheetKind === "marked" ? await readMarksSheet(prepared, qs, model, subjectOf(test)) : await gradeSheet(prepared, qs, model, subjectOf(test)));
       setStage("review");
     } catch (e) {
       setError(e instanceof Error ? e.message : "採点に失敗しました");
@@ -187,7 +193,7 @@ const Grade = () => {
   const grade = async () => {
     if (!source) return;
     setError("");
-    const prepared = await prepareSheet(source, quad, test, side);
+    const prepared = await prepareSheet(source, quad, test, side, sheetKind);
     if (sheet) URL.revokeObjectURL(sheet.url);
     setSheet(prepared);
     // ピンぼけ・暗いなどの写真は、AIに送る前に撮り直しをすすめる（読み間違いと料金のむだを防ぐ）
@@ -254,7 +260,8 @@ const Grade = () => {
   const answerOf = (no: string) => questionOf(no)?.answer ?? "";
   const isWritten = (no: string) => allowsPartial(questionOf(no)?.format);
   // AIなし・記述式は、解答欄の画像を見ながら判定する
-  const showCrop = (no: string) => (mode === "manual" || needsImage(questionOf(no)?.format)) && cropUrls.has(no);
+  const showCrop = (no: string) => (mode === "manual" || sheetKind === "marked" || needsImage(questionOf(no)?.format)) && cropUrls.has(no);
+  const marked = sheetKind === "marked";
   const keyUrl = answerKey.sheets[side];
   const comparing = compare && !!keyUrl;
 
@@ -289,6 +296,36 @@ const Grade = () => {
         </div>
       ) : (
         <section className="card">
+          <div className="mb-3 flex flex-wrap items-center gap-2 border-b border-line pb-3">
+            <p className="label mb-0">答案の種類</p>
+            <div className="inline-flex flex-wrap rounded-xl border border-line bg-white p-1 text-sm">
+              {(
+                [
+                  ["blank", "まだ丸付けしていない答案"],
+                  ["marked", "先生が丸付け済みの答案"],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  disabled={stage === "grading" || stage === "review"}
+                  onClick={() => {
+                    setSheetKind(k);
+                    setSetting("sheetKind", k);
+                  }}
+                  className={`rounded-lg px-3 py-1 font-bold disabled:opacity-60 ${sheetKind === k ? "bg-ink text-white" : "text-muted"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {marked && (
+              <p className="w-full text-xs text-muted">
+                {mode === "ai"
+                  ? "紙で丸付けした答案を撮ると、先生が付けた○✕△をAIが読み取って、そのまま採点結果にします（児童の答えの正誤はAIに判断させません）。"
+                  : "紙で丸付けした答案を撮ると、解答欄のまわりを切り出して並べます。先生の○✕を見ながらタップで入力してください。"}
+              </p>
+            )}
+          </div>
           <div className="flex flex-wrap items-center gap-2">
             <p className="label mb-0">出席番号を選ぶ</p>
             {sides.length > 1 && (
@@ -404,7 +441,7 @@ const Grade = () => {
               <p className="rounded-lg bg-accent/5 p-3 text-sm">
                 {mode === "ai" ? (
                   <>
-                    🔒 端末の中で名前欄を塗りつぶし、<b>解答欄だけを切り出して</b>AIに送ります。答案全体・名前・正答は送りません。
+                    🔒 端末の中で名前欄を塗りつぶし、<b>解答欄{marked ? "のまわり" : ""}だけを切り出して</b>AIに送ります。答案全体・名前・正答は送りません。
                   </>
                 ) : (
                   <>
@@ -418,7 +455,7 @@ const Grade = () => {
                   ← 戻る（撮る前に戻る）
                 </button>
                 <button className="btn-pen flex-1 text-lg" onClick={grade}>
-                  {mode === "ai" ? "○ AIで採点する" : "○ 解答欄を切り出して丸付けへ"}
+                  {mode === "ai" ? (marked ? "○ 先生の○✕をAIで読み取る" : "○ AIで採点する") : marked ? "○ 解答欄を切り出して○✕を入力へ" : "○ 解答欄を切り出して丸付けへ"}
                 </button>
               </div>
             </div>
@@ -454,7 +491,7 @@ const Grade = () => {
           {stage === "grading" && (
             <div className="grid place-items-center gap-3 py-16 text-muted">
               <span className="size-12 animate-spin rounded-full border-4 border-line border-t-pen" />
-              AIが解答欄を読み取っています…
+              {marked ? "AIが先生の○✕を読み取っています…" : "AIが解答欄を読み取っています…"}
             </div>
           )}
 
@@ -537,13 +574,19 @@ const Grade = () => {
                                 <img src={answerKey.crops.get(i.no)} alt={`${i.no}の解答`} className="max-h-24 w-full rounded border border-pen/40 bg-white object-contain" />
                               </span>
                             </span>
-                            {mode === "ai" && <span className="block text-xs">読み取り：{i.studentAnswer || "（空欄）"}</span>}
+                            {mode === "ai" &&
+                              (i.teacherMark ? (
+                                <span className="block text-xs">読み取った先生の印：{i.teacherMark}</span>
+                              ) : (
+                                <span className="block text-xs">読み取り：{i.studentAnswer || "（空欄）"}</span>
+                              ))}
                           </>
                         ) : showCrop(i.no) ? (
                           <>
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img src={cropUrls.get(i.no)} alt={`${i.no}の解答欄`} className="max-h-24 w-full rounded border border-line object-contain" />
                             {mode === "ai" && i.studentAnswer && <span className="block text-xs">読み取り：{i.studentAnswer}</span>}
+                            {i.teacherMark && <span className="block text-xs">読み取った先生の印：{i.teacherMark}</span>}
                             <span className="block text-xs text-muted">
                               {questionOf(i.no)?.format === "essay" ? "模範解答" : "正答"} {answerOf(i.no)}
                             </span>
@@ -571,7 +614,8 @@ const Grade = () => {
                   {mode === "manual"
                     ? "画像の？か ○✕ ボタンをタップして判定します。未判定のまま確定すると、あとで「問題ごとに並べる」画面で全員分をまとめて丸付けできます。"
                     : null}
-                  {mode === "ai" && "黄色は「字が読みにくい」「2通りに読める」「答えの形に合わない」などの理由で先生の確認が必要な問題です。いま直さなくても、あとで「要確認をまとめて見る」から確認できます。"}
+                  {mode === "ai" && marked && "黄色は「先生の印が読みにくい」「印が見つからない」「△の点数がわからない」問題です。画像を見て○✕△をタップしてください。"}
+                  {mode === "ai" && !marked && "黄色は「字が読みにくい」「2通りに読める」「答えの形に合わない」などの理由で先生の確認が必要な問題です。いま直さなくても、あとで「要確認をまとめて見る」から確認できます。"}
                 </p>
                 <button className="btn-pen w-full text-lg" onClick={confirmResult}>
                   {sides.length > 1 && sideOrder === "student" && studentNo !== null && sides.some((x) => x !== side && !doneSides(studentNo).includes(x))
