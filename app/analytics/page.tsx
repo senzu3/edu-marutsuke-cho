@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { type ReactNode, Suspense, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLiveQuery } from "dexie-react-hooks";
 import { ExcelExportButton } from "@/components/ExcelExportButton";
@@ -12,7 +12,7 @@ import { SUBJECTS, type Subject, subjectOf } from "@/lib/subjects";
 type Tab = "class" | "student" | "test";
 
 /** 単色の横棒（正答率）。値の文字は棒の色ではなく文字色で表示 */
-const Bar = ({ label, rate, sub, warn }: { label: string; rate: number; sub?: string; warn?: boolean }) => (
+const Bar = ({ label, rate, sub, warn, note }: { label: string; rate: number; sub?: string; warn?: boolean; note?: ReactNode }) => (
   <div className="grid grid-cols-[minmax(0,10rem)_1fr_3.5rem] items-center gap-3 text-sm" title={`${label}：${pct(rate)}${sub ? `（${sub}）` : ""}`}>
     <span className="truncate">
       {warn && <span className="mr-1 text-pen">▼</span>}
@@ -22,8 +22,23 @@ const Bar = ({ label, rate, sub, warn }: { label: string; rate: number; sub?: st
       <span className="block h-full rounded-full bg-accent" style={{ width: `${Math.max(rate * 100, 1)}%` }} />
     </span>
     <span className="text-right font-bold tabular-nums">{pct(rate)}</span>
+    {note && <span className="col-span-3 -mt-2 text-xs">{note}</span>}
   </div>
 );
+
+/** 丸付け済みの答案に書かれた合計点が、○✕と配点から計算した点と合わないか（全部の面を採点し終えたときだけ比べる） */
+const writtenMismatch = (test: Test | undefined, r: Result) =>
+  !!test && r.writtenScore !== undefined && gradedSides(test, r).length === sidesOf(test).length && r.writtenScore !== r.score;
+
+/** 答案に書かれた合計点の表示（読み取れていないときは何も出さない） */
+const WrittenScore = ({ test, r }: { test: Test | undefined; r: Result }) =>
+  r.writtenScore === undefined ? null : writtenMismatch(test, r) ? (
+    <span className="font-bold text-pen">
+      ⚠ 答案の合計点 {r.writtenScore}点（計算した点 {r.score}点と合いません）
+    </span>
+  ) : (
+    <span className="text-muted">答案の合計点 {r.writtenScore}点</span>
+  );
 
 /** A・B・C の目安の印 */
 const AbcBadge = ({ rate }: { rate: number }) => {
@@ -282,7 +297,22 @@ const StudentView = ({ students, tests, results }: { students: Student[]; tests:
             {[...mine]
               .sort((a, b) => (tests.find((t) => t.id === a.testId)?.createdAt ?? 0) - (tests.find((t) => t.id === b.testId)?.createdAt ?? 0))
               .map((r) => (
-                <Bar key={r.id} label={tests.find((t) => t.id === r.testId)?.title ?? "?"} rate={r.score / r.total} sub={`${r.score}/${r.total}点`} />
+                <Bar
+                  key={r.id}
+                  label={tests.find((t) => t.id === r.testId)?.title ?? "?"}
+                  rate={r.score / r.total}
+                  sub={`${r.score}/${r.total}点`}
+                  note={
+                    r.writtenScore !== undefined && (
+                      <>
+                        <span className="text-muted">
+                          {r.score}/{r.total}点・
+                        </span>
+                        <WrittenScore test={tests.find((t) => t.id === r.testId)} r={r} />
+                      </>
+                    )
+                  }
+                />
               ))}
           </section>
         </>
@@ -337,6 +367,18 @@ const TestView = ({ students, tests, results, initial }: { students: Student[]; 
               </p>
             </div>
           </div>
+          {rs.some((r) => writtenMismatch(test, r)) && (
+            <p className="rounded-lg border border-pen bg-pen/5 px-3 py-2 text-sm text-pen">
+              ⚠ 答案に書かれた合計点と、○✕から計算した点が合わない児童がいます：
+              <b>
+                {rs
+                  .filter((r) => writtenMismatch(test, r))
+                  .map((r) => `${r.studentNo}番`)
+                  .join("、")}
+              </b>
+              。採点画面か「問題ごとに見る」で○✕△と配点を確認してください。
+            </p>
+          )}
           <section className="card space-y-3">
             <h2 className="font-bold">問題ごとの正答率（低い順）</h2>
             {qs.map((q) => (
@@ -355,6 +397,11 @@ const TestView = ({ students, tests, results, initial }: { students: Student[]; 
                       <td>{s.name}</td>
                       <td className="text-right tabular-nums">
                         {r ? `${r.score}/${r.total}点` : <span className="text-muted">未採点</span>}
+                        {r?.writtenScore !== undefined && (
+                          <span className="block text-xs">
+                            <WrittenScore test={test} r={r} />
+                          </span>
+                        )}
                         {r && sidesOf(test).length > gradedSides(test, r).length && (
                           <span className="block text-xs text-review">
                             {sidesOf(test)
