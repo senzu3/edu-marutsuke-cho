@@ -56,6 +56,8 @@ export type Test = {
   back?: { template: Template; masks: Rect[] }; // 裏面（ある場合だけ）
   /** 教員用の解答用紙（赤刷りなど）。答案用紙と同じ大きさにまっすぐ補正した画像。端末内だけに保存し、AIには送らない */
   answerKeys?: Partial<Record<Side, Blob>>;
+  /** 点数欄の位置（丸付け済みの答案から、先生が書いた合計点を読み取るため。名前欄と同じく補正後の用紙上の位置） */
+  scoreBox?: { side: Side; rect: Rect };
 };
 
 /** テストのある面の答案用紙と黒塗り範囲 */
@@ -98,6 +100,7 @@ export type Result = {
   total: number;
   image?: Blob; // 表面の答案。設定で「画像を保存する」がONのときだけ
   backImage?: Blob; // 裏面の答案（同上）
+  writtenScore?: number; // 丸付け済みの答案に先生が書いた合計点（読み取れたとき）
 };
 
 export type Setting = { key: string; value: string };

@@ -8,13 +8,14 @@ import { AnswerKeyCapture } from "@/components/AnswerKeyCapture";
 import { CornerEditor } from "@/components/CornerEditor";
 import { GradeOverlay } from "@/components/GradeOverlay";
 import { JudgeButtons } from "@/components/JudgeButtons";
+import { RectEditor } from "@/components/RectEditor";
 import { PhotoInput } from "@/components/PhotoInput";
 import { useAnswerKey } from "@/lib/answer-key";
 import { allowsPartial, needsImage } from "@/lib/judge";
 import { subjectOf } from "@/lib/subjects";
 import { gradeDraftKey, clearDraft, loadDraft, useAutoSaveDraft } from "@/lib/drafts";
 import { type ResultItem, SIDE_LABEL, type Side, type Test, calcScore, db, getSetting, gradedSides, setSetting, sheetOf, sidesOf } from "@/lib/db";
-import { type PreparedSheet, type SheetKind, type Verdict, applyVerdict, gradeSheet, isUnjudged, manualItems, prepareSheet, questionsOn, readMarksSheet, saveResult } from "@/lib/grading";
+import { type PreparedSheet, type SheetKind, type Verdict, applyVerdict, gradeSheet, isUnjudged, manualItems, prepareSheet, questionsOn, readMarksSheet, resolvePartialByTotal, saveResult } from "@/lib/grading";
 import { useGradingMode, useKeepImages, useModel } from "@/lib/settings-hooks";
 import { QUALITY_MESSAGES, type Quad, type SourceImage, defaultQuad, detectQuad, encodeJpeg, loadSource } from "@/lib/warp";
 
@@ -32,6 +33,7 @@ type GradeDraft = {
   autoCorners: boolean;
   items: ResultItem[];
   kind?: SheetKind;
+  writtenTotal?: number | null;
 };
 
 const Grade = () => {
@@ -58,6 +60,8 @@ const Grade = () => {
   const [quad, setQuad] = useState<Quad>(defaultQuad());
   const [sheet, setSheet] = useState<PreparedSheet | null>(null);
   const [items, setItems] = useState<ResultItem[]>([]);
+  // 丸付け済みの答案に先生が書いた合計点（読み取った値。先生が直すこともできる）
+  const [writtenTotal, setWrittenTotal] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [autoCorners, setAutoCorners] = useState(false);
   // 教員用の解答用紙と並べて見比べるか
@@ -87,6 +91,7 @@ const Grade = () => {
         if (draft.stage === "review") {
           setSheet(await prepareSheet(loaded, draft.quad, test, draft.side, draft.kind));
           setItems(draft.items);
+          setWrittenTotal(draft.writtenTotal ?? null);
         }
         setStage(draft.stage);
         setResumed(true);
@@ -103,9 +108,9 @@ const Grade = () => {
   const draftValue = useMemo<GradeDraft | null>(
     () =>
       sourceBlob && studentNo !== null && stage !== "photo"
-        ? { studentNo, side, stage: stage === "review" ? "review" : "corners", source: sourceBlob, quad, autoCorners, items: stage === "review" ? items : [], kind: sheetKind }
+        ? { studentNo, side, stage: stage === "review" ? "review" : "corners", source: sourceBlob, quad, autoCorners, items: stage === "review" ? items : [], kind: sheetKind, writtenTotal }
         : null,
-    [sourceBlob, studentNo, side, stage, quad, autoCorners, items, sheetKind],
+    [sourceBlob, studentNo, side, stage, quad, autoCorners, items, sheetKind, writtenTotal],
   );
   const draftMeta = test && studentNo !== null
     ? { label: `${test.title}の採点（${studentNo}番${test.back ? `・${SIDE_LABEL[side]}面` : ""}）`, href: `/grade?id=${testId}` }
@@ -136,6 +141,8 @@ const Grade = () => {
   const reset = () => {
     if (source) URL.revokeObjectURL(source.url);
     if (sheet) URL.revokeObjectURL(sheet.url);
+    if (sheet?.scoreCrop) URL.revokeObjectURL(sheet.scoreCrop.url);
+    setWrittenTotal(null);
     setSource(null);
     setSourceBlob(null);
     setSheet(null);
@@ -182,7 +189,13 @@ const Grade = () => {
     setStage("grading");
     try {
       const qs = questionsOn(test, side);
-      setItems(sheetKind === "marked" ? await readMarksSheet(prepared, qs, model, subjectOf(test)) : await gradeSheet(prepared, qs, model, subjectOf(test)));
+      if (sheetKind === "marked") {
+        const read = await readMarksSheet(prepared, qs, model, subjectOf(test));
+        // 書かれた合計点がわかれば、点数のわからない△を逆算する
+        const others = results.find((r) => r.studentNo === studentNo)?.items.filter((i) => !qs.some((q) => q.no === i.no)) ?? [];
+        setItems(read.writtenTotal !== null ? resolvePartialByTotal(read.items, others, test, read.writtenTotal) : read.items);
+        setWrittenTotal(read.writtenTotal);
+      } else setItems(await gradeSheet(prepared, qs, model, subjectOf(test)));
       setStage("review");
     } catch (e) {
       setError(e instanceof Error ? e.message : "採点に失敗しました");
@@ -222,6 +235,9 @@ const Grade = () => {
   const otherItems = currentResultForScore?.items.filter((i) => !sideQuestions.some((q) => q.no === i.no)) ?? [];
   const { score, total } = calcScore([...otherItems, ...items], test.questions);
   const reviewCount = items.filter((i) => i.needsReview).length;
+  // 書かれた合計点と比べられるのは、ほかの面も採点済みのときだけ（合計点はテスト全体の点のため）
+  const otherSidesDone = studentNo !== null && sides.every((x) => x === side || doneSides(studentNo).includes(x));
+  const totalMismatch = !!sheet?.scoreCrop && writtenTotal !== null && otherSidesDone && writtenTotal !== score;
   const unjudgedCount = items.filter(isUnjudged).length;
   const markRestCorrect = () =>
     setItems((xs) => xs.map((x) => (isUnjudged(x) ? { ...x, correct: true, needsReview: false, byTeacher: true } : x)));
@@ -232,7 +248,8 @@ const Grade = () => {
 
   const confirmResult = async () => {
     if (studentNo === null || !sheet) return;
-    await saveResult(test, studentNo, side, items, sheet, keepImages);
+    if (totalMismatch && !confirm(`答案に書かれた合計点（${writtenTotal}点）と、○✕から計算した点（${score}点）が合いません。このまま確定しますか？`)) return;
+    await saveResult(test, studentNo, side, items, sheet, keepImages, sheet.scoreCrop ? writtenTotal : undefined);
     reset();
     const done = (no: number, x: Side) => (no === studentNo && x === side) || doneSides(no).includes(x);
     const nextStudent = (x: Side) =>
@@ -285,6 +302,7 @@ const Grade = () => {
       </div>
 
       <AnswerKeyManager test={test} sheets={answerKey.sheets} />
+      {sheetKind === "marked" && <ScoreBoxManager test={test} />}
 
       {students.length === 0 ? (
         <div className="card">
@@ -545,6 +563,38 @@ const Grade = () => {
                     reviewCount > 0 && <span className="ml-auto rounded-full bg-review/15 px-3 py-1 text-sm font-bold text-review">要確認 {reviewCount}</span>
                   )}
                 </div>
+                {sheet.scoreCrop && (
+                  <div className={`space-y-1.5 rounded-xl border p-2 text-sm ${totalMismatch ? "border-pen bg-pen/5" : "border-line"}`}>
+                    <div className="flex items-center gap-2">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={sheet.scoreCrop.url} alt="点数欄" className="h-14 max-w-[45%] rounded border border-line bg-white object-contain" />
+                      <label className="flex flex-1 items-center gap-1">
+                        答案の合計点
+                        <input
+                          type="number"
+                          min={0}
+                          className="input w-20 px-2 py-1"
+                          value={writtenTotal ?? ""}
+                          placeholder="—"
+                          onChange={(e) => setWrittenTotal(e.target.value === "" ? null : Number(e.target.value))}
+                          aria-label="答案に書かれた合計点"
+                        />
+                        点
+                      </label>
+                    </div>
+                    {writtenTotal === null ? (
+                      <p className="text-xs text-muted">{mode === "ai" ? "合計点を読み取れませんでした。" : ""}答案に書かれた合計点を入れると、○✕から計算した点と比べます。</p>
+                    ) : !otherSidesDone ? (
+                      <p className="text-xs text-muted">もう一方の面が未採点のため、合計点はまだ比べられません。</p>
+                    ) : totalMismatch ? (
+                      <p className="text-xs font-bold text-pen">
+                        ⚠ ○✕から計算した点（{score}点）と合いません。○✕△と配点を確認してください。
+                      </p>
+                    ) : (
+                      <p className="text-xs text-ok">✓ ○✕から計算した点と一致しました。</p>
+                    )}
+                  </div>
+                )}
                 {unjudgedCount > 0 && (
                   <button className="btn-ghost w-full" onClick={markRestCorrect}>
                     ✓ 残り{unjudgedCount}問を全部○にする（✕の問題だけ先に付けておく）
@@ -680,6 +730,55 @@ const AnswerKeyManager = ({ test, sheets }: { test: Test; sheets: Partial<Record
             </div>
           );
         })}
+      </div>
+    </details>
+  );
+};
+
+/** 点数欄の位置（丸付け済みの答案から、先生が書いた合計点を読み取るため）。答案用紙の上を指でなぞって囲む */
+const ScoreBoxManager = ({ test }: { test: Test }) => {
+  const sides = sidesOf(test);
+  const [side, setSide] = useState<Side>(test.scoreBox?.side ?? "front");
+  const template = sheetOf(test, side)?.template;
+  const url = useMemo(() => (template ? URL.createObjectURL(template.image) : ""), [template]);
+  useEffect(() => () => URL.revokeObjectURL(url), [url]);
+  const box = test.scoreBox?.side === side ? test.scoreBox.rect : null;
+
+  return (
+    <details className="card group" open={!test.scoreBox}>
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-bold">
+        <span className="text-muted transition group-open:rotate-90">▶</span>
+        点数欄
+        <span className={`rounded-full px-2 py-0.5 text-xs ${test.scoreBox ? "bg-ok/10 text-ok" : "bg-line/60 text-muted"}`}>
+          {test.scoreBox ? `${sides.length > 1 ? `${SIDE_LABEL[test.scoreBox.side]}面に` : ""}登録済み` : "未登録"}
+        </span>
+        <span className="ml-auto text-xs font-normal text-muted">囲むと、答案に書いた合計点も読み取って、○✕から計算した点と比べます</span>
+      </summary>
+      <div className="mt-3 space-y-2">
+        <p className="text-sm text-muted">先生が合計点を書く欄（「点」の欄）を、指でなぞって囲んでください。1つのテストにつき1回だけです。</p>
+        {sides.length > 1 && (
+          <div className="inline-flex rounded-xl border border-line bg-white p-1 text-sm">
+            {sides.map((x) => (
+              <button key={x} onClick={() => setSide(x)} className={`rounded-lg px-3 py-1 font-bold ${side === x ? "bg-ink text-white" : "text-muted"}`}>
+                {SIDE_LABEL[x]}面
+              </button>
+            ))}
+          </div>
+        )}
+        {url && (
+          <div className="mx-auto max-w-md">
+            <RectEditor
+              imageUrl={url}
+              rects={box ? [{ rect: box, label: "点", kind: "active" }] : []}
+              onDraw={(rect) => db.tests.update(test.id!, { scoreBox: { side, rect } })}
+            />
+          </div>
+        )}
+        {test.scoreBox && (
+          <button className="btn-ghost py-1 text-sm" onClick={() => confirm("点数欄の登録を外しますか？") && db.tests.update(test.id!, { scoreBox: undefined })}>
+            登録を外す
+          </button>
+        )}
       </div>
     </details>
   );

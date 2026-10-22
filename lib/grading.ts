@@ -9,6 +9,7 @@ export type PreparedSheet = {
   blob: Blob;
   crops: { no: string; base64: string; blob: Blob }[]; // base64=AIに送る読みやすく整えた画像、blob=確認画面用の元の画像
   issues: QualityIssue[]; // 写真の品質の問題（ピンぼけなど）
+  scoreCrop?: { base64: string; url: string }; // 丸付け済みの答案の点数欄（点数欄を登録した面だけ）
 };
 
 /** その面にある問題 */
@@ -37,7 +38,15 @@ export const prepareSheet = async (source: SourceImage, quad: Quad, test: Test, 
     }),
   );
   const { blob } = await encodeJpeg(canvas);
-  return { url: URL.createObjectURL(blob), blob, crops, issues: assessQuality(canvas) };
+  const scoreBox = kind === "marked" && test.scoreBox?.side === side ? test.scoreBox.rect : null;
+  const scoreCrop = scoreBox ? await encodeJpeg(cropBox(canvas, scoreBox, 0.1), 0.9) : null;
+  return {
+    url: URL.createObjectURL(blob),
+    blob,
+    crops,
+    issues: assessQuality(canvas),
+    ...(scoreCrop ? { scoreCrop: { base64: scoreCrop.base64, url: URL.createObjectURL(scoreCrop.blob) } } : {}),
+  };
 };
 
 /** AIに解答欄を書き写させ（1回）、端末内で正答表と照合する */
@@ -52,14 +61,42 @@ export const gradeSheet = async (sheet: PreparedSheet, questions: Question[], mo
 };
 
 /** 丸付け済みの答案：AIが先生の印（○✕△）を読み取り、そのまま採点結果にする。読み取りに迷う問題は「要確認」 */
-export const readMarksSheet = async (sheet: PreparedSheet, questions: Question[], model: ModelId, subject: Subject): Promise<ResultItem[]> => {
+export const readMarksSheet = async (
+  sheet: PreparedSheet,
+  questions: Question[],
+  model: ModelId,
+  subject: Subject,
+): Promise<{ items: ResultItem[]; writtenTotal: number | null }> => {
   const res = await requestReadMarks(
     questions.map((q) => ({ no: q.no, image: sheet.crops.find((c) => c.no === q.no)!.base64, hint: `配点${q.points}点` })),
     model,
     subject,
+    sheet.scoreCrop?.base64,
   );
   const byNo = new Map(res.marks.map((m) => [m.no, m]));
-  return questions.map((q) => markItem(q, byNo.get(q.no)?.mark ?? "なし", byNo.get(q.no)?.points ?? null, byNo.get(q.no)?.clear ?? false));
+  return {
+    items: questions.map((q) => markItem(q, byNo.get(q.no)?.mark ?? "なし", byNo.get(q.no)?.points ?? null, byNo.get(q.no)?.clear ?? false)),
+    writtenTotal: sheet.scoreCrop ? res.written_total : null,
+  };
+};
+
+const PARTIAL_UNKNOWN = "△（部分点）：点数を確認してください";
+
+/**
+ * 答案に書かれた合計点から、点数のわからない△を1つだけ逆算する。
+ * 点数不明の△がちょうど1問で、差が0点より大きく配点より小さいときだけ埋める（それ以外はそのまま）
+ */
+export const resolvePartialByTotal = (sideItems: ResultItem[], otherItems: ResultItem[], test: Test, written: number) => {
+  const unknown = sideItems.filter((i) => i.needsReview && i.reasons?.includes(PARTIAL_UNKNOWN));
+  if (unknown.length !== 1) return sideItems;
+  const target = unknown[0];
+  const points = test.questions.find((q) => q.no === target.no)?.points ?? 0;
+  const rest = calcScore([...otherItems, ...sideItems.filter((i) => i !== target)], test.questions).score;
+  const earned = written - rest;
+  if (!(earned > 0 && earned < points)) return sideItems;
+  return sideItems.map((i) =>
+    i === target ? { ...i, correct: false, earned, needsReview: false, reasons: [`△の点数（${earned}点）を、答案に書かれた合計点から計算しました`] } : i,
+  );
 };
 
 /** 先生の印1つを採点結果にする */
@@ -71,7 +108,7 @@ const markItem = (q: Question, mark: TeacherMark, points: number | null, clear: 
   if (mark === "△") {
     // 得点が書いてあり、配点の範囲に収まっていれば部分点に。なければ先生に点数をたずねる
     if (points !== null && points > 0 && points < q.points) return { ...base, correct: false, earned: points, confidence: 0.8, needsReview: false };
-    return review("△（部分点）：点数を確認してください");
+    return review(PARTIAL_UNKNOWN);
   }
   return { ...base, correct: mark === "○", confidence: 0.9, needsReview: false };
 };
@@ -99,7 +136,15 @@ export const isUnjudged = (item: ResultItem) => item.needsReview && isManual(ite
  * 1つの面の採点結果を保存する。同じ児童のその面の結果は上書きし、もう一方の面の結果は残す（表と裏を別々に撮れる）。
  * 切り出し画像は横並び採点用に端末内に残す
  */
-export const saveResult = async (test: Test, studentNo: number, side: Side, sideItems: ResultItem[], sheet: PreparedSheet, keepImage: boolean) => {
+export const saveResult = async (
+  test: Test,
+  studentNo: number,
+  side: Side,
+  sideItems: ResultItem[],
+  sheet: PreparedSheet,
+  keepImage: boolean,
+  writtenScore?: number | null,
+) => {
   const testId = test.id!;
   const sideNos = new Set(questionsOn(test, side).map((q) => q.no));
   await db.transaction("rw", [db.results, db.crops, db.tests], async () => {
@@ -108,7 +153,9 @@ export const saveResult = async (test: Test, studentNo: number, side: Side, side
     const merged = [...(existing?.items.filter((i) => !sideNos.has(i.no)) ?? []), ...sideItems];
     const items = test.questions.flatMap((q) => merged.filter((i) => i.no === q.no));
     const { score, total } = calcScore(items, test.questions);
-    const { image: _front, backImage: _back, ...kept } = existing ?? {};
+    const { image: _front, backImage: _back, writtenScore: oldWritten, ...kept } = existing ?? {};
+    // 点数欄のある面を撮り直したときだけ、書かれた合計点を入れかえる
+    const written = test.scoreBox?.side === side ? (writtenScore ?? undefined) : oldWritten;
     await db.results.put({
       ...kept,
       testId,
@@ -120,6 +167,7 @@ export const saveResult = async (test: Test, studentNo: number, side: Side, side
       ...(existing?.image && side !== "front" ? { image: existing.image } : {}),
       ...(existing?.backImage && side !== "back" ? { backImage: existing.backImage } : {}),
       ...(keepImage ? { [side === "back" ? "backImage" : "image"]: sheet.blob } : {}),
+      ...(written !== undefined ? { writtenScore: written } : {}),
     });
     await db.crops.where({ testId, studentNo }).filter((c) => sideNos.has(c.no)).delete();
     await db.crops.bulkAdd(sheet.crops.map((c) => ({ testId, studentNo, no: c.no, blob: c.blob })));

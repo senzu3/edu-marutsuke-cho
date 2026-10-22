@@ -38,6 +38,16 @@ export const GradeRequest = z
   })
   .strict();
 
+/** 丸付け済みの答案：解答欄のまわりの画像に加えて、点数欄の切り出し画像（あれば）を送る */
+export const MarksRequest = z
+  .object({
+    model: modelField,
+    subject: subjectField,
+    items: GradeRequest.shape.items,
+    scoreImage: z.string().min(100).max(1_500_000).optional(),
+  })
+  .strict();
+
 export type GradeItem = z.infer<typeof GradeRequest>["items"][number];
 
 // ---- AIの出力形式 ----
@@ -71,6 +81,7 @@ const MarksSchema = z.object({
       clear: z.boolean(),
     }),
   ),
+  written_total: z.number().nullable(),
 });
 
 export type KeyOutput = z.infer<typeof KeySchema>;
@@ -124,7 +135,8 @@ const marksPrompt = (subject: Subject) => `${common(subject)}
   - "なし": 採点の印が見当たらない
 - points: 印のそばに、その問題の得点が数字で書かれていればその数（例: 「3」→ 3）。減点の書き方（「-2」など）や、数字がないときは null
 - clear: 印がはっきり読み取れるなら true。かすれている・となりの欄の印と重なっていて、どの欄の印か迷う場合は false
-画像の端に写っている、となりの解答欄の印は読まないでください。`;
+画像の端に写っている、となりの解答欄の印は読まないでください。
+- written_total: 【点数欄】の画像があれば、先生がそこに書いた合計点の数字（例: 「85点」→ 85）。【点数欄】の画像がない・数字が書かれていない・読み取れない場合は null`;
 
 type UserContent = Anthropic.Beta.Messages.BetaContentBlockParam[];
 
@@ -162,8 +174,22 @@ export const runTranscribe = (client: Anthropic, items: GradeItem[], model: Mode
   callClaude(client, model, [...cropBlocks(items), { type: "text", text: transcribePrompt(subject) }], TranscribeSchema);
 
 /** 採点済みの答案から、先生の印を読み取る（AIは1回だけ） */
-export const runReadMarks = (client: Anthropic, items: GradeItem[], model: ModelId, subject: Subject) =>
-  callClaude(client, model, [...cropBlocks(items), { type: "text", text: marksPrompt(subject) }], MarksSchema);
+export const runReadMarks = (client: Anthropic, items: GradeItem[], model: ModelId, subject: Subject, scoreImage?: string) =>
+  callClaude(
+    client,
+    model,
+    [
+      ...cropBlocks(items),
+      ...(scoreImage
+        ? [
+            { type: "text" as const, text: "【点数欄】" },
+            { type: "image" as const, source: { type: "base64" as const, media_type: "image/jpeg" as const, data: scoreImage } },
+          ]
+        : []),
+      { type: "text", text: marksPrompt(subject) },
+    ],
+    MarksSchema,
+  );
 
 /** エラーをユーザー向けの文に変換（内容はログに残さない）。keyHint はAPIキーの確認場所 */
 export const toUserError = (e: unknown, keyHint = ".env.local を確認") => {

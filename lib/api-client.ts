@@ -11,7 +11,7 @@ export type ExtractedKey = {
 export type GradeResponse = { answers: Transcription[] };
 
 export type TeacherMark = "○" | "✕" | "△" | "なし";
-export type MarksResponse = { marks: { no: string; mark: TeacherMark; points: number | null; clear: boolean }[] };
+export type MarksResponse = { marks: { no: string; mark: TeacherMark; points: number | null; clear: boolean }[]; written_total: number | null };
 
 export type GradeRequestItem = { no: string; image: string; hint: string };
 
@@ -47,9 +47,9 @@ export const requestGrade = async (items: GradeRequestItem[], model: ModelId, su
   return transcribeDirect(await ownKey(), items, model, subject);
 };
 
-/** 採点済みの答案：解答欄のまわりの切り出し画像から、先生が付けた○✕△を読み取る（氏名・答案全体は送らない） */
-export const requestReadMarks = async (items: GradeRequestItem[], model: ModelId, subject: Subject): Promise<MarksResponse> => {
-  if (!STATIC_EDITION) return post<MarksResponse>("/api/read-marks", { items, model, subject });
+/** 採点済みの答案：解答欄のまわりと点数欄の切り出し画像から、先生が付けた○✕△と合計点を読み取る（氏名・答案全体は送らない） */
+export const requestReadMarks = async (items: GradeRequestItem[], model: ModelId, subject: Subject, scoreImage?: string): Promise<MarksResponse> => {
+  if (!STATIC_EDITION) return post<MarksResponse>("/api/read-marks", { items, model, subject, ...(scoreImage ? { scoreImage } : {}) });
   const { readMarksDirect } = await import("./ai-browser");
-  return readMarksDirect(await ownKey(), items, model, subject);
+  return readMarksDirect(await ownKey(), items, model, subject, scoreImage);
 };
